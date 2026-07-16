@@ -1,0 +1,11 @@
+# 원본/중간/결과 산출물 (재생성 가능, 용량·보안)
+data/raw/*
+data/interim/*
+data/processed/*
+!data/**/.gitkeep
+reports/figures/*.png
+reports/summary.json
+reports/report_run.md
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
