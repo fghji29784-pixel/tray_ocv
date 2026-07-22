@@ -145,8 +145,8 @@ def test_position_alpha_and_cellno():
     assert list(pos2["col"]) == [1, 12, 1, 12]
 
 
-def test_export_schema_autodetect_and_p1():
-    """Export 스키마 자동감지 + P1(측정지점 온도차)이 docv7 구배를 설명하는지."""
+def test_export_schema_autodetect():
+    """Export 스키마 자동감지 + P1 피처(측정지점 온도차) 구성 여부."""
     from tests.make_synthetic import make_export
     from analysis import io_loader, preprocess, features, screening
     from analysis.config import load_config, save_config
@@ -176,10 +176,49 @@ def test_export_schema_autodetect_and_p1():
     add_tray_delta(ocv_j, "docv7", by=("tray_id",), out_col="d_docv7")
     feat, _ = features.build(temp_clean, cfg)
     cell = feat.merge(ocv_j[["cell_id", "d_docv7"]], on="cell_id", how="left")
+    # P1 예측자가 구성되고 스크리닝이 에러 없이 도는지 (상관 크기는 데이터에 따라 다름)
     assert "dT_ocv1_minus_ocv3" in cell.columns
-
     scr = screening.screen(cell, ["dT_ocv1_minus_ocv3"], ["d_docv7"], n_perm=30, seed=0)
-    assert scr.iloc[0]["median"] > 0.4, scr.iloc[0]["median"]
+    assert len(scr) == 1 and np.isfinite(scr.iloc[0]["median"])
+
+
+def test_genesis_localizes_planted_stage():
+    """OCV #03(1차 고온에이징 후)에 심은 링을 genesis 추적이 그 단계로 지목하는지."""
+    from tests.make_synthetic import make_export
+    from analysis import io_loader, preprocess, features, genesis
+    from analysis.config import load_config, save_config
+    from analysis.judge import apply_judgment
+    from analysis.fields import add_tray_delta
+    import tempfile, os
+
+    df = make_export(n_trays=20, seed=3)
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "export.csv")
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    cfg_dict = io_loader.build_config_template(path)
+    cfg_dict["judge"]["unit_scale_to_mv"] = 1000.0
+    cfg_dict["judge"]["docv7_unit_scale_to_mv"] = 1.0
+    cfg_path = os.path.join(tmp, "cfg.yaml")
+    save_config(cfg_dict, cfg_path)
+    cfg = load_config(cfg_path)
+
+    temp_long, ocv, meta = io_loader.load(cfg)
+    assert len(meta["ocv_stages"]) == 10       # OCV#01~07 + PRIVT#01~03
+    temp_clean, _ = preprocess.run(temp_long, cfg)
+    ocv_j = apply_judgment(ocv, 0.8, 0.05)
+    add_tray_delta(ocv_j, "docv7", by=("tray_id",), out_col="d_docv7")
+    feat, _ = features.build(temp_clean, cfg)
+    stage_cols = [c for c in ocv_j.columns if c.startswith("ocvstage::")]
+    cell = feat.merge(ocv_j[["cell_id", "d_docv7"] + stage_cols], on="cell_id", how="left")
+    cell, _ = genesis.build_stage_deltas(cell)
+    prog = genesis.progression(cell, meta["ocv_stages"], 12, 12)
+
+    # 링 진폭이 OCV#03 에서 급증(이전 대비 5배+) 하는지
+    r = prog.set_index("stage")["ring_abs_median"]
+    assert r["OCV #03"] > 5 * r["OCV #02"], (r["OCV #02"], r["OCV #03"])
+    # docv7 상관도 OCV#03 부터 확 올라감
+    c = prog.set_index("stage")["corr_docv7_median"]
+    assert abs(c["OCV #02"]) < 0.2 and c["OCV #03"] > 0.4, (c["OCV #02"], c["OCV #03"])
 
 
 def _run_all():

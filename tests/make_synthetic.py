@@ -96,15 +96,19 @@ def make_export(n_trays=30, n_rows=12, n_cols=12, seed=0, coupling_mv_per_K=0.15
     charges = [f"Charge #{i:02d}" for i in range(1, 8)]
     discharges = [f"DisCharge #{i:02d}" for i in range(1, 8)]
     rows = []
+    # 중간 OCV 단계 base 전압(SOC별) — 링 발생 추적 테스트용
+    inter_soc = {"OCV #01": 3.00, "OCV #02": 3.20, "OCV #03": 3.20,
+                 "OCV #04": 3.45, "OCV #05": 3.45, "OCV #06": 3.60, "OCV #07": 3.35}
     for t in range(n_trays):
         tray_id = f"T{t:03d}"
         ring_amp_C = rng.choice([0.0, 0.0, 1.0, 2.0, 3.0])
         sign = rng.choice([1.0, -1.0])
         env = 25.0 + rng.normal(0, 0.3)
-        # 전용OCV 측정지점 온도 필드 (#01, #03 이 서로 다른 링 국면)
-        T_ocv1 = env + sign * ring_amp_C * ring + rng.normal(0, 0.15, ring.shape)
-        T_ocv3 = env + 0.4 * sign * ring_amp_C * ring + rng.normal(0, 0.15, ring.shape)
+        T_ocv1 = env + rng.normal(0, 0.15, ring.shape)   # 측정시점엔 이미 냉각 (P1 약함)
+        T_ocv3 = env + rng.normal(0, 0.15, ring.shape)
         T_ocv2 = 0.5 * (T_ocv1 + T_ocv3)
+        # ★ genesis: 1차 고온에이징 후(OCV #03)에 태어나 이후 유지되는 링 상태 (mV 스케일)
+        ring_state = sign * ring_amp_C * ring   # 트레이별 링 필드
         for r in range(n_rows):
             for c in range(n_cols):
                 # 실제 형식: Cell No 1..144(행우선), Cell 위치 A01..L12 (알파벳=행)
@@ -126,14 +130,19 @@ def make_export(n_trays=30, n_rows=12, n_cols=12, seed=0, coupling_mv_per_K=0.15
                     rec[f"{name} 최저 온도"] = base - abs(rng.normal(0.4, 0.2))
                     rec[f"{name} 평균 온도"] = base
                     rec[f"{name} 최고 온도"] = base + abs(rng.normal(0.6, 0.3))
-                # 전용OCV 측정지점 온도
+                # 전용OCV 측정지점 온도 (냉각됨 → docv7과 무관)
                 rec["PRIVT OCV #01 온도"] = T_ocv1[r, c]
                 rec["PRIVT OCV #02 온도"] = T_ocv2[r, c]
                 rec["PRIVT OCV #03 온도"] = T_ocv3[r, c]
-                # docv7 = 커플링(측정시점 온도차) + 잡음 (mV)
-                dT = (T_ocv1[r, c] - np.median(T_ocv1)) - (T_ocv3[r, c] - np.median(T_ocv3))
-                docv7 = coupling_mv_per_K * dT + rng.normal(0, 0.05)
-                ocv3 = 3.35 + rng.normal(0, 0.0005)
+                rs = ring_state[r, c]                    # 이 셀의 링 상태 (mV)
+                # 중간 OCV: #01,#02 는 링 없음(baseline), #03 부터 링 상태가 각인
+                for name, base in inter_soc.items():
+                    born = name not in ("OCV #01", "OCV #02")
+                    v = base + (rs / 1000.0 if born else 0.0) + rng.normal(0, 0.0003)
+                    rec[f"{name} OCV"] = v
+                # docv7 = 링 상태에 비례한 자기방전 차 (측정온도 아님) + 잡음
+                docv7 = 0.15 * rs + rng.normal(0, 0.05)      # mV
+                ocv3 = 3.35 + rs / 1000.0 + rng.normal(0, 0.0005)
                 rec["PRIVT OCV #03 OCV"] = ocv3
                 rec["PRIVT OCV #01 OCV"] = ocv3 + docv7 / 1000.0
                 rec["PRIVT OCV #02 OCV"] = ocv3 + 0.6 * docv7 / 1000.0

@@ -38,6 +38,33 @@ def plot_field_gallery(df: pd.DataFrame, value_col: str, n_rows: int, n_cols: in
     return out_path
 
 
+def plot_stage_progression(prog: pd.DataFrame, out_path, title=""):
+    """단계별 링 진폭 + docv7 필드 상관을 공정 순서로 (구배 발생 추적)."""
+    if prog.empty:
+        return None
+    x = range(len(prog))
+    fig, ax1 = plt.subplots(figsize=(max(7, 0.7 * len(prog)), 4.2))
+    ax1.plot(x, prog["ring_abs_median"], "o-", color="#c0392b", label="ring |amplitude| median")
+    ax1.set_ylabel("dOCV ring |amplitude| (median)", color="#c0392b")
+    ax1.tick_params(axis="y", labelcolor="#c0392b")
+    ax1.set_xticks(list(x))
+    labels = [f"{r.stage}\n(SOC{int(r.soc)})" if pd.notna(r.soc) else r.stage
+              for r in prog.itertuples()]
+    ax1.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax2 = ax1.twinx()
+    ax2.plot(x, prog["corr_docv7_median"], "s--", color="#2c3e50",
+             label="corr with final d_docv7")
+    ax2.set_ylabel("corr with final d_docv7 field", color="#2c3e50")
+    ax2.tick_params(axis="y", labelcolor="#2c3e50")
+    ax2.axhline(0, color="gray", lw=0.5)
+    ax1.set_title(title or "OCV stage — gradient genesis tracking")
+    fig.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
 def plot_corr_heatmap(screen_df: pd.DataFrame, out_path, value="median", title=""):
     """스텝×타깃 상관 히트맵 (screen 결과 pivot)."""
     if screen_df.empty:

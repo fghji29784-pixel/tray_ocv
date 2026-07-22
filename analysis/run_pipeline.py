@@ -22,7 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import correction, features, io_loader, preprocess, propagation, screening, viz
+from . import (correction, features, genesis, io_loader, preprocess, propagation,
+               screening, viz)
 from .config import Config, load_config, save_config
 from .fields import add_tray_delta, structure_table
 from .grids import infer_shape
@@ -80,8 +81,10 @@ def _build_cell_table(cfg: Config, log: "Progress"):
                .rename("any_imputed").reset_index())
 
     id_cols = ["lot", "tray_id", "row", "col", "cell_id"]
+    stage_cols = [c for c in ocv_j.columns if c.startswith("ocvstage::")]
     ocv_keep = id_cols + ["ocv1", "ocv2", "ocv3", "docv7", "docv7_tray_mode",
-                          "docv7_dev", "judge_fail", "d_ocv1", "d_ocv2", "d_ocv3", "d_docv7"]
+                          "docv7_dev", "judge_fail", "d_ocv1", "d_ocv2", "d_ocv3",
+                          "d_docv7"] + stage_cols
     cell = feat.merge(ocv_j[ocv_keep], on=id_cols, how="left")
     cell = cell.merge(any_imp, on="cell_id", how="left")
     cell["any_imputed"] = cell["any_imputed"].fillna(False)
@@ -172,6 +175,30 @@ def cmd_run(args):
     if len(prog):
         prog.to_csv(proc / "ocv_progression.csv", index=False)
 
+    # --- S8 구배 발생 추적 (원인 공정 국소화) ---
+    stage_meta = meta.get("ocv_stages", [])
+    genesis_prog = pd.DataFrame()
+    if stage_meta:
+        log(f"[S8] 구배 발생 추적 — OCV 단계 {len(stage_meta)}개")
+        log("S8  단계별 Δ필드 + docv7 상관 …", 1)
+        cell, _ = genesis.build_stage_deltas(cell)
+        genesis_prog = genesis.progression(cell, stage_meta, n_rows, n_cols)
+        seg = genesis.selfdischarge_segments(cell, stage_meta, n_rows, n_cols)
+        genesis_prog.to_csv(proc / "genesis_progression.csv", index=False)
+        if len(seg):
+            seg.to_csv(proc / "genesis_selfdischarge_segments.csv", index=False)
+        # docv7 링과 처음 크게 일치하는 단계 로그
+        gp = genesis_prog.dropna(subset=["corr_docv7_median"])
+        if len(gp):
+            best = gp.loc[gp["corr_docv7_median"].abs().idxmax()]
+            log(f"S8  docv7 링과 최고 일치 단계: {best['stage']} "
+                f"(corr={best['corr_docv7_median']:.3f}, 링진폭={best['ring_abs_median']:.3g})", 2)
+        viz.plot_stage_progression(genesis_prog,
+                                   outdir / "figures" / "genesis_progression.png",
+                                   title="OCV stage - gradient genesis tracking")
+    else:
+        log("[S8] 구배 발생 추적 생략 — 중간 OCV 단계 칼럼 없음", 0)
+
     log("[S7] 구배 보정")
     corr_preds = fit.get("predictors", path_preds) if fit.get("ok") else path_preds
     log("S7  (1안) 온도 인자 기반 보정 …", 1)
@@ -214,11 +241,12 @@ def cmd_run(args):
         "ocv_progression": prog.to_dict("records") if len(prog) else [],
         "holdout": hold,
         "correction_eval": corr_eval,
+        "genesis_progression": genesis_prog.to_dict("records") if len(genesis_prog) else [],
         "n_fail_raw": int(cell["judge_fail"].sum()) if "judge_fail" in cell else None,
     }
     with open(outdir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2, default=_json_default)
-    _write_markdown(summary, scr, corr_eval, outdir / "report_run.md")
+    _write_markdown(summary, scr, corr_eval, outdir / "report_run.md", genesis_prog)
     log(f"[완료] 결과: {outdir}/summary.json, {outdir}/report_run.md, {proc}/")
 
 
@@ -253,10 +281,21 @@ def _json_default(o):
     return str(o)
 
 
-def _write_markdown(summary, scr, corr_eval, path):
+def _write_markdown(summary, scr, corr_eval, path, genesis_prog=None):
     lines = ["# 온도–OCV 구배 분석 실행 리포트\n"]
     m = summary["meta"]
     lines.append(f"- 셀 {m['n_cells']}, 트레이 {m['n_trays']}, 스텝 {m['n_steps']}\n")
+
+    if genesis_prog is not None and len(genesis_prog):
+        lines.append("\n## 구배 발생 추적 (OCV 단계별)\n")
+        lines.append("| 단계 | SOC | 링 진폭(median) | 최종 Δdocv7 상관 | 부호일관성 |")
+        lines.append("|---|---|---|---|---|")
+        for r in genesis_prog.itertuples():
+            soc = f"{int(r.soc)}" if pd.notna(r.soc) else "–"
+            lines.append(f"| {r.stage} | {soc} | {_f(r.ring_abs_median)} | "
+                         f"{_f(r.corr_docv7_median)} | {_f(r.corr_docv7_signcons)} |")
+        lines.append("\n> 링 진폭이 커지고 'Δdocv7 상관'이 처음 높아지는 단계 = "
+                     "구배가 태어난(확정된) 공정.\n")
     lines.append("\n## 상관 스크리닝 상위 (전체)\n")
     lines.append("| predictor | target | median r | sign_consist | q_fdr |")
     lines.append("|---|---|---|---|---|")

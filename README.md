@@ -93,8 +93,19 @@ temperature_columns:
 | `features` (S4) | 셀×스텝 온도 피처 (환경 vs 자기발열 프록시 분리) |
 | `screening` (S5) | 전 스텝 × OCV 전수 상관 (permutation + BH-FDR) |
 | `propagation` (S6) | P1/P2/P3 경로 판별 회귀 + 홀드아웃 검증 |
-| `correction` (S7) | 인자 기반 보정 + 공간 detrend 폴백 + 판정 영향 평가 |
+| `genesis` (S8) | **구배 발생 추적** — 중간 OCV(#01~#07)+전용 OCV 단계별 ΔOCV 링을 공정 순서로 훑어 docv7 링이 태어난 공정 국소화 |
+| `correction` (S7) | 인자 기반 보정 + 공간 detrend(원인 규명 후 적용) + 판정 영향 평가 |
 | `judge` | 트레이 mode + (docv7−mode)>0.8mV 판정 |
+
+### 구배 발생 추적 (S8) — 원인 공정 국소화
+
+`OCV #01~#07`(중간 측정) + `PRIVT OCV`(전용)의 트레이 내 ΔOCV 링 필드를 공정
+순서대로 계산한다. **링 진폭이 급증하고 최종 Δdocv7 필드와의 공간 상관이 처음
+높아지는 단계 = 구배가 태어난 공정.** 예: OCV #03(1차 고온에이징 후)에서 링이
+없다가 나타나면 → 1차 고온에이징 챔버 열구배가 원인. 결과는
+`reports/figures/genesis_progression.png` 와 `report_run.md`의 표로 나온다.
+(온도로 설명 안 되는 docv7 구배의 발생 시점을 OCV 값 자체로 짚는다 — 공간
+detrend 같은 증상 제거가 아니라 원인 공정 지목.)
 
 ## 검증
 

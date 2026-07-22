@@ -166,6 +166,43 @@ def _detect_ocv(cols: list[str]) -> dict:
     return {"columns": columns, "docv7_direct": docv7_direct}
 
 
+# 단계별 SOC 추정 (구배 발생 추적 표시용; 공정 순서 기준 best-effort)
+_STAGE_SOC = {
+    "OCV #01": 0, "OCV #02": 10, "OCV #03": 10, "OCV #04": 70, "OCV #05": 70,
+    "OCV #06": 100, "OCV #07": 30,
+    "PRIVT OCV #01": 30, "PRIVT OCV #02": 30, "PRIVT OCV #03": 30,
+}
+
+
+def _detect_ocv_stages(cols: list[str]) -> list[dict]:
+    """모든 OCV 측정 단계값(중간 OCV #01~#07 + 전용 PRIVT OCV #01~#03) 감지.
+
+    반환: [{label, col, order, is_privt, num, soc}] — 공정 순서(중간→전용) 정렬.
+    구배가 어느 공정 단계에서 처음 생기는지 추적하는 데 쓴다.
+    """
+    inter = re.compile(r"^\s*OCV\s*#?0*(\d+)\s*OCV\s*$", re.IGNORECASE)
+    privt = re.compile(r"^\s*PRIVT\s*OCV\s*#?0*(\d+)\s*OCV\s*$", re.IGNORECASE)
+    stages = []
+    for c in cols:
+        cs = str(c)
+        mp = privt.match(cs)
+        mi = inter.match(cs)
+        if mp:
+            n = int(mp.group(1))
+            stages.append({"label": f"PRIVT OCV #{n:02d}", "col": c,
+                           "is_privt": True, "num": n})
+        elif mi:
+            n = int(mi.group(1))
+            stages.append({"label": f"OCV #{n:02d}", "col": c,
+                           "is_privt": False, "num": n})
+    # 중간 OCV(번호순) 먼저, 전용 OCV(번호순) 뒤
+    stages.sort(key=lambda s: (s["is_privt"], s["num"]))
+    for i, s in enumerate(stages):
+        s["order"] = i
+        s["soc"] = _STAGE_SOC.get(s["label"])
+    return stages
+
+
 def _to_index(s: pd.Series) -> pd.Series:
     """행/열 라벨을 1-based 정수로. 숫자면 그대로, 알파벳이면 A→1,B→2,…(대소문자 무관)."""
     s = s.astype(str).str.strip()
@@ -265,7 +302,14 @@ def load(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     else:
         ocv["docv7"] = ocv["ocv1"] - ocv["ocv3"]
 
+    # --- 단계별 OCV (구배 발생 추적용) ---
+    stages = _detect_ocv_stages(list(df.columns))
+    for s in stages:
+        ocv[f"ocvstage::{s['label']}"] = pd.to_numeric(df[s["col"]], errors="coerce") * scale
+
     meta = _integrity_report(temp_long, ocv, cfg)
+    meta["ocv_stages"] = [{"label": s["label"], "order": s["order"], "soc": s["soc"]}
+                          for s in stages]
     return temp_long, ocv, meta
 
 
