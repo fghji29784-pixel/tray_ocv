@@ -92,7 +92,8 @@ def _bh_fdr(pvals: np.ndarray) -> np.ndarray:
 
 def screen(cell_tbl: pd.DataFrame, predictors: list[str], targets: list[str],
            n_perm: int = 500, seed: int = 0, min_cells: int = 8,
-           exclude_imputed: bool = False, imputed_col: str = "any_imputed") -> pd.DataFrame:
+           exclude_imputed: bool = False, imputed_col: str = "any_imputed",
+           progress=None) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     df = cell_tbl
     if exclude_imputed and imputed_col in df.columns:
@@ -104,9 +105,11 @@ def screen(cell_tbl: pd.DataFrame, predictors: list[str], targets: list[str],
                  for c in set(predictors) | set(targets) if c in df.columns}
 
     rows = []
-    for tgt in targets:
+    for ti, tgt in enumerate(targets):
         if tgt not in col_cache:
             continue
+        if progress:
+            progress(f"타깃 {tgt} ({ti + 1}/{len(targets)}) — 예측자 {len(predictors)}개")
         y = col_cache[tgt]
         for pred in predictors:
             if pred not in col_cache:

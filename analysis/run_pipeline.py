@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -47,20 +49,31 @@ def cmd_make_config(args):
         print("  미매핑 스텝:", ", ".join(unresolved))
 
 
-def _build_cell_table(cfg: Config):
+def _build_cell_table(cfg: Config, log: "Progress"):
     """S1~S4 실행 후 분석용 셀 테이블·부속 산출물 반환."""
+    log("S1  파일 로딩 + wide→long 변환 …", 1)
     temp_long, ocv_cell, meta = io_loader.load(cfg)
-    temp_clean, impute_rep = preprocess.run(temp_long, cfg)
+    log(f"S1  완료 — 셀 {meta['n_cells']}, 트레이 {meta['n_trays']}, "
+        f"온도측정 스텝 {meta['n_steps']}", 2)
 
-    # 판정
+    log("S2  전처리 (결측/≤22°C 삭제 → 3×3 이웃 평균 치환) …", 1)
+    temp_clean, impute_rep = preprocess.run(temp_long, cfg)
+    if len(impute_rep):
+        log(f"S2  완료 — 무효 {int(impute_rep['n_invalid'].sum())}, "
+            f"3×3치환 {int(impute_rep['n_imputed_3x3'].sum())}, "
+            f"중앙값폴백 {int(impute_rep['n_fallback_median'].sum())}", 2)
+
+    log("판정  트레이 mode + (docv7−mode)>offset …", 1)
     ocv_j = apply_judgment(ocv_cell, cfg.raw["judge"]["offset_mv"],
                            cfg.raw["judge"]["mode_bin_mv"])
+    log(f"판정  완료 — 불량 셀 {int(ocv_j['judge_fail'].sum())}", 2)
     # OCV Δ필드 (트레이 중앙값 제거)
     for c in ("ocv1", "ocv2", "ocv3", "docv7"):
         add_tray_delta(ocv_j, c, by=("tray_id",), out_col=f"d_{c}")
 
-    # 피처
+    log("S4  온도 피처 추출 (Δ필드 + 프록시 + 열노출) …", 1)
     feat, long_delta = features.build(temp_clean, cfg)
+    log(f"S4  완료 — 피처 칼럼 {feat.shape[1]}개", 2)
 
     # 셀별 치환 플래그
     any_imp = (temp_clean.groupby("cell_id")["imputed"].any()
@@ -94,56 +107,86 @@ def cmd_run(args):
     outdir = Path(args.outdir)
     (outdir / "figures").mkdir(parents=True, exist_ok=True)
     proc = Path("data/processed"); proc.mkdir(parents=True, exist_ok=True)
+    log = Progress(enabled=not args.quiet)
 
-    print("[S1-S4] 로딩·전처리·피처 …")
-    cell, temp_clean, long_delta, impute_rep, meta = _build_cell_table(cfg)
+    log("[S1–S4] 로딩·전처리·판정·피처")
+    cell, temp_clean, long_delta, impute_rep, meta = _build_cell_table(cfg, log)
     n_rows, n_cols = infer_shape(cell, cfg.raw["tray_shape"]["n_rows"],
                                  cfg.raw["tray_shape"]["n_cols"])
     _save_table(cell, proc / "cell_table")
     impute_rep.to_csv(proc / "impute_report.csv", index=False)
-    print(f"  셀 {meta['n_cells']}, 트레이 {meta['n_trays']}, 스텝 {meta['n_steps']}, "
-          f"격자 {n_rows}x{n_cols}")
+    log(f"셀 테이블 저장 완료 — 격자 {n_rows}×{n_cols}", 1)
 
     step_preds, proxy, heat = _predictor_lists(cfg, cell)
     predictors = step_preds + proxy + heat
     targets = [t for t in ["d_ocv1", "d_ocv2", "d_ocv3", "d_docv7"] if t in cell.columns]
 
-    print("[S5] 전수 상관 스크리닝 …")
+    n_combo = len(predictors) * len(targets)
+    log(f"[S5] 전수 상관 스크리닝 — 예측자 {len(predictors)} × 타깃 {len(targets)} "
+        f"= {n_combo} 조합, permutation {n_perm}회")
+    log("S5  (a) 전체 셀 …", 1)
     scr = screening.screen(cell, predictors, targets, n_perm=n_perm, seed=seed,
-                           exclude_imputed=False)
+                           exclude_imputed=False,
+                           progress=lambda m: log(m, 2))
+    log("S5  (b) 치환 셀 제외 (감도분석) …", 1)
     scr_excl = screening.screen(cell, predictors, targets, n_perm=n_perm, seed=seed,
-                                exclude_imputed=True)
+                                exclude_imputed=True,
+                                progress=lambda m: log(m, 2))
     scr.to_csv(proc / "screening_all.csv", index=False)
     scr_excl.to_csv(proc / "screening_exclude_imputed.csv", index=False)
     sim = screening.step_similarity(cell, step_preds)
     sim.to_csv(proc / "step_similarity.csv")
+    if len(scr):
+        r = scr.iloc[0]
+        log(f"S5  완료 — 최상위: {r['predictor']} × {r['target']} "
+            f"(median r={r['median']:.3f}, q={r['q_fdr']:.3g})", 2)
     viz.plot_corr_heatmap(scr[scr["predictor"].isin(step_preds)],
                           outdir / "figures" / "corr_heatmap_steps.png",
                           title="step ΔT × OCV target (per-tray median corr)")
+    log("S5  히트맵 저장", 2)
 
-    print("[S6] 경로 판별 회귀 …")
+    log("[S6] 경로 판별 회귀 + 검증")
     # 열노출은 Ea별로 서로 단조변환(공선성) → 회귀엔 대표 1개만 사용
     heat_one = [heat[len(heat) // 2]] if heat else []
     path_preds = [c for c in ["dT_preOCV_proxy", "dT_HT_adjacent"] + heat_one
                   if c in cell.columns]
+    log(f"S6  회귀 (예측자 {path_preds}) …", 1)
     fit = propagation.fit_paths(cell, "d_docv7", path_preds, exclude_imputed=False)
+    if fit.get("ok"):
+        log(f"S6  R²={fit['r2']:.3f}, n={fit['n']}", 2)
+    else:
+        log(f"S6  회귀 생략 — {fit.get('reason')}", 2)
     top_step = scr.iloc[0]["predictor"] if len(scr) else (step_preds[0] if step_preds else None)
+    log(f"S6  ΔOCV1→2→3 진행분석 (기준 {top_step}) …", 1)
     prog = (propagation.ocv_progression(cell, top_step) if top_step is not None
             else pd.DataFrame())
+    log("S6  홀드아웃 검증 (트레이 8:2) …", 1)
     hold = propagation.holdout_validate(cell, "d_docv7", path_preds, seed=seed)
+    if hold.get("ok"):
+        log(f"S6  홀드아웃 pred vs actual median r="
+            f"{hold['pred_vs_actual']['median']:.3f}", 2)
     if len(prog):
         prog.to_csv(proc / "ocv_progression.csv", index=False)
 
-    print("[S7] 구배 보정 …")
+    log("[S7] 구배 보정")
     corr_preds = fit.get("predictors", path_preds) if fit.get("ok") else path_preds
+    log("S7  (1안) 온도 인자 기반 보정 …", 1)
     cell = correction.fit_factor_correction(cell, corr_preds, target="docv7")
+    log("S7  (2안) 공간 detrend 폴백 …", 1)
     cell = correction.fit_spatial_detrend(cell, target="docv7", degree=2)
+    log("S7  보정 전후 판정 영향 평가 …", 1)
     corr_eval = correction.evaluate(
         cell, {"factor": "docv7_corr_factor", "spatial": "docv7_corr_spatial"},
         cfg, n_rows, n_cols)
+    if "factor" in corr_eval:
+        e = corr_eval["factor"]
+        log(f"S7  factor 보정 — 링 진폭 {corr_eval['none']['ring_abs_median']:.3f}"
+            f"→{e['ring_abs_median']:.3f}, 핫셀보존 "
+            f"{e.get('hotcell_preserved')}/{e.get('hotcell_total')}", 2)
     _save_table(cell, proc / "cell_table_corrected")
 
     # 그림
+    log("그림 저장 (갤러리) …", 1)
     viz.plot_field_gallery(cell, "d_docv7", n_rows, n_cols,
                            outdir / "figures" / "gallery_docv7.png",
                            title="ΔdOCV7 (tray-median removed)")
@@ -172,7 +215,20 @@ def cmd_run(args):
     with open(outdir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2, default=_json_default)
     _write_markdown(summary, scr, corr_eval, outdir / "report_run.md")
-    print(f"[done] 결과: {outdir}/summary.json, {outdir}/report_run.md, {proc}/")
+    log(f"[완료] 결과: {outdir}/summary.json, {outdir}/report_run.md, {proc}/")
+
+
+class Progress:
+    """경과시간·flush 포함 진행 로거 (Windows 콘솔 버퍼링 대비)."""
+    def __init__(self, enabled: bool = True):
+        self.t0 = time.time()
+        self.enabled = enabled
+
+    def __call__(self, msg: str, indent: int = 0):
+        if not self.enabled:
+            return
+        el = time.time() - self.t0
+        print(f"[{el:6.1f}s] {'  ' * indent}{msg}", flush=True)
 
 
 def _save_table(df: pd.DataFrame, path_no_ext: Path):
@@ -249,6 +305,7 @@ def build_parser():
     pr.add_argument("--config", required=True)
     pr.add_argument("--outdir", default="reports")
     pr.add_argument("--perm", type=int, default=None, help="permutation 횟수 override")
+    pr.add_argument("--quiet", action="store_true", help="단계별 진행 출력 끄기")
     pr.set_defaults(func=cmd_run)
     return p
 
