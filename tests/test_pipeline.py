@@ -221,6 +221,53 @@ def test_genesis_localizes_planted_stage():
     assert abs(c["OCV #02"]) < 0.2 and c["OCV #03"] > 0.4, (c["OCV #02"], c["OCV #03"])
 
 
+def test_genesis_math_beta_and_moran():
+    """β·a_k·Moran's I·변화점이 심어둔 OCV#03 발생을 일관되게 지목하는지."""
+    from tests.make_synthetic import make_export
+    from analysis import io_loader, preprocess, features, genesis, genesis_math
+    from analysis.config import load_config, save_config
+    from analysis.judge import apply_judgment
+    from analysis.fields import add_tray_delta
+    import tempfile, os
+
+    df = make_export(n_trays=20, seed=5)
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "export.csv")
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+    cfg_dict = io_loader.build_config_template(path)
+    cfg_dict["judge"]["unit_scale_to_mv"] = 1000.0
+    cfg_dict["judge"]["docv7_unit_scale_to_mv"] = 1.0
+    cfg_path = os.path.join(tmp, "cfg.yaml")
+    save_config(cfg_dict, cfg_path)
+    cfg = load_config(cfg_path)
+
+    temp_long, ocv, meta = io_loader.load(cfg)
+    temp_clean, _ = preprocess.run(temp_long, cfg)
+    ocv_j = apply_judgment(ocv, 0.8, 0.05)
+    add_tray_delta(ocv_j, "docv7", by=("tray_id",), out_col="d_docv7")
+    feat, _ = features.build(temp_clean, cfg)
+    stage_cols = [c for c in ocv_j.columns if c.startswith("ocvstage::")]
+    cell = feat.merge(ocv_j[["cell_id", "d_docv7"] + stage_cols], on="cell_id", how="left")
+    cell, _ = genesis.build_stage_deltas(cell)
+
+    align, beta = genesis_math.alignment_and_projection(cell, meta["ocv_stages"], 12, 12)
+    moran = genesis_math.morans_progression(cell, meta["ocv_stages"], 12, 12)
+    cp = genesis_math.changepoint(align)
+
+    # β 최대(무자명) 공정이 HT1(OCV#02→#03)
+    bc = beta[beta["matched_soc"] & ~beta["composes_docv7"]]
+    top = bc.loc[bc["beta_median"].abs().idxmax()]
+    assert top["to_stage"] == "OCV #03", top["to_stage"]
+    # a_k: OCV#02 낮고 OCV#03 급등
+    a = align.set_index("stage")["a_median"]
+    assert abs(a["OCV #02"]) < 0.2 and a["OCV #03"] > 0.4
+    # Moran's I: OCV#02 무구조, OCV#03 구조
+    mi = moran.set_index("stage")["moran_median"]
+    assert mi["OCV #03"] > mi["OCV #02"] + 0.2
+    # 변화점 = OCV #03
+    assert cp["ok"] and cp["stage"] == "OCV #03", cp
+
+
 def _run_all():
     fns = [v for k, v in globals().items() if k.startswith("test_") and callable(v)]
     failed = 0

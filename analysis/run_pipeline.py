@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import (correction, features, genesis, io_loader, preprocess, propagation,
-               screening, viz)
+from . import (correction, features, genesis, genesis_math, io_loader, preprocess,
+               propagation, screening, viz)
 from .config import Config, load_config, save_config
 from .fields import add_tray_delta, structure_table
 from .grids import infer_shape
@@ -209,8 +209,46 @@ def cmd_run(args):
         viz.plot_stage_progression(genesis_prog,
                                    outdir / "figures" / "genesis_progression.png",
                                    title="OCV stage - gradient genesis tracking")
+
+        # --- 수학적 발생 규명 (a_k, β_k, Moran's I, 변화점) ---
+        log("S8  수학 분석: 누적정렬 a_k, 증분투영 β_k, Moran's I, 변화점 …", 1)
+        align, beta = genesis_math.alignment_and_projection(cell, stage_meta, n_rows, n_cols)
+        moran = genesis_math.morans_progression(cell, stage_meta, n_rows, n_cols)
+        cp = genesis_math.changepoint(align)
+        align.to_csv(proc / "genesis_alignment.csv", index=False)
+        beta.to_csv(proc / "genesis_beta.csv", index=False)
+        moran.to_csv(proc / "genesis_moran.csv", index=False)
+        genesis_math_out = {"align": align, "beta": beta, "moran": moran, "cp": cp}
+        # 종합 판정 로그
+        if cp.get("ok"):
+            log(f"S8  변화점(a_k 급등): {cp['stage']}", 2)
+        bcand = beta[beta["matched_soc"] & ~beta["composes_docv7"]].dropna(subset=["beta_median"])
+        if len(bcand):
+            bb = bcand.loc[bcand["beta_median"].abs().idxmax()]
+            log(f"S8  β 최대 공정(원인): {bb['process']} (β={bb['beta_median']:.3g})", 2)
+
+        # --- 발표용 시각자료 ---
+        log("S8  발표용 시각자료 생성 …", 1)
+        pres = outdir / "figures" / "presentation"
+        trays_curated = _curate_trays(cell, n_rows, n_cols, n_top=8, n_rand=4, seed=seed)
+        stage_labels = [m["label"] for m in sorted(stage_meta, key=lambda x: x.get("order", 0))]
+        # 단계별 OCV 갤러리
+        sub_cur = cell[cell["tray_id"].isin(trays_curated)]
+        for lab in stage_labels:
+            dcol = f"d_ocvstage::{lab}"
+            if dcol in cell.columns:
+                viz.plot_field_gallery(sub_cur, dcol, n_rows, n_cols,
+                                       pres / f"gallery_stage_{_safe(lab)}.png",
+                                       max_trays=12, title=f"dOCV field — {lab}")
+        # 스토리보드 / β 막대 / a_k·Moran 곡선
+        viz.plot_storyboard(cell, stage_labels, trays_curated[:6], n_rows, n_cols,
+                            pres / "storyboard.png")
+        viz.plot_beta_contributions(beta, pres / "beta_contributions.png")
+        viz.plot_alignment_moran(align, moran, pres / "alignment_moran.png",
+                                 changepoint_stage=cp.get("stage"))
     else:
         log("[S8] 구배 발생 추적 생략 — 중간 OCV 단계 칼럼 없음", 0)
+        genesis_math_out = None
 
     log("[S7] 구배 보정")
     corr_preds = fit.get("predictors", path_preds) if fit.get("ok") else path_preds
@@ -261,7 +299,7 @@ def cmd_run(args):
         json.dump(summary, f, ensure_ascii=False, indent=2, default=_json_default)
     genesis_steps = steps if stage_meta and len(steps) else None
     _write_markdown(summary, scr, corr_eval, outdir / "report_run.md",
-                    genesis_prog, genesis_steps)
+                    genesis_prog, genesis_steps, genesis_math_out)
     log(f"[완료] 결과: {outdir}/summary.json, {outdir}/report_run.md, {proc}/")
 
 
@@ -276,6 +314,26 @@ class Progress:
             return
         el = time.time() - self.t0
         print(f"[{el:6.1f}s] {'  ' * indent}{msg}", flush=True)
+
+
+def _safe(s: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in str(s)).strip("_")
+
+
+def _curate_trays(cell: pd.DataFrame, n_rows: int, n_cols: int,
+                  n_top: int = 8, n_rand: int = 4, seed: int = 0) -> list:
+    """발표 갤러리용 트레이 큐레이션: Δdocv7 링 진폭 상위 + 무작위."""
+    from .fields import structure_table
+    if "d_docv7" not in cell.columns:
+        trays = list(cell["tray_id"].dropna().unique())
+        return trays[:n_top + n_rand]
+    st = structure_table(cell, "d_docv7", n_rows, n_cols, by=("tray_id",))
+    st = st.dropna(subset=["ring"])
+    top = st.reindex(st["ring"].abs().sort_values(ascending=False).index)["tray_id"].head(n_top).tolist()
+    rng = np.random.default_rng(seed)
+    rest = [t for t in cell["tray_id"].dropna().unique() if t not in top]
+    rand = list(rng.choice(rest, size=min(n_rand, len(rest)), replace=False)) if rest else []
+    return top + rand
 
 
 def _save_table(df: pd.DataFrame, path_no_ext: Path):
@@ -296,10 +354,47 @@ def _json_default(o):
     return str(o)
 
 
-def _write_markdown(summary, scr, corr_eval, path, genesis_prog=None, genesis_steps=None):
+def _write_markdown(summary, scr, corr_eval, path, genesis_prog=None, genesis_steps=None,
+                    gmath=None):
     lines = ["# 온도–OCV 구배 분석 실행 리포트\n"]
     m = summary["meta"]
     lines.append(f"- 셀 {m['n_cells']}, 트레이 {m['n_trays']}, 스텝 {m['n_steps']}\n")
+
+    if gmath is not None:
+        align, beta, moran, cp = gmath["align"], gmath["beta"], gmath["moran"], gmath["cp"]
+        # 종합 판정 문장
+        verdict = []
+        if cp.get("ok"):
+            verdict.append(f"변화점(a_k 급등)=**{cp['stage']}**")
+        bc = beta[beta["matched_soc"] & ~beta["composes_docv7"]].dropna(subset=["beta_median"])
+        if len(bc):
+            bb = bc.loc[bc["beta_median"].abs().idxmax()]
+            verdict.append(f"β 최대 공정=**{bb['process']}** (β={_f(bb['beta_median'])})")
+        mo = moran.dropna(subset=["moran_median"])
+        mo_first = mo[mo["moran_median"] > 0.1]
+        if len(mo_first):
+            verdict.append(f"Moran's I 최초 유의=**{mo_first.iloc[0]['stage']}**")
+        lines.append("\n## 구배 발생 — 수학적 종합 판정\n")
+        lines.append("> " + " · ".join(verdict) + "\n" if verdict else "> (판정 불가)\n")
+        lines.append("\n### 단계별 누적 정렬 a_k / Moran's I\n")
+        lines.append("| 단계 | SOC | a_k(정렬) | 부호일관성 | Moran's I |")
+        lines.append("|---|---|---|---|---|")
+        mo_map = dict(zip(moran["stage"], moran["moran_median"])) if moran is not None else {}
+        for r in align.itertuples():
+            soc = f"{int(r.soc)}" if pd.notna(r.soc) else "–"
+            lines.append(f"| {r.stage} | {soc} | {_f(r.a_median)} | {_f(r.a_sign)} | "
+                         f"{_f(mo_map.get(r.stage))} |")
+        lines.append("\n### 공정별 증분 투영 β_k (원인 지목)\n")
+        lines.append("| 공정 | 구간 | matched SOC | β_k | 부호일관성 |")
+        lines.append("|---|---|---|---|---|")
+        for r in beta.itertuples():
+            flag = "✓" if r.matched_soc else "—"
+            if r.composes_docv7:
+                flag = "(docv7구성)"
+            lines.append(f"| {r.process} | {r.from_stage}→{r.to_stage} | {flag} | "
+                         f"{_f(r.beta_median)} | {_f(r.beta_sign)} |")
+        lines.append("\n> β_k = 그 공정의 변화가 최종 Δdocv7 방향에 주입한 양. "
+                     "matched-SOC(✓) 중 |β| 최대가 원인 공정.\n")
 
     if genesis_steps is not None and len(genesis_steps):
         lines.append("\n## 공정별 구배 기여 (인접 OCV 차이 = 그 공정의 변화)\n")
