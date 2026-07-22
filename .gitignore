@@ -9,3 +9,7 @@ reports/report_run.md
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# 생성되는 사용자/데이터별 매핑 config
+analysis/*_config.yaml
+reports_export/

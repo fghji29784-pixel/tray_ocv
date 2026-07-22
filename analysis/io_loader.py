@@ -11,6 +11,7 @@ import difflib
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .config import CANONICAL_STEPS, DEFAULT_CONFIG, Config
@@ -61,13 +62,20 @@ def build_config_template(path: str | Path, sheet=0) -> dict:
     cfg["input"]["path"] = str(path)
     cfg["input"]["sheet"] = sheet
 
-    # 온도 스텝 매핑 (퍼지)
-    used: set[str] = set()
-    for step in CANONICAL_STEPS:
-        pick = _fuzzy_pick(step, [c for c in cols if c not in used])
-        cfg["temperature_columns"][step] = pick
-        if pick:
-            used.add(pick)
+    # --- 1) Export 형식 우선 감지 (…평균/최저/최고 온도, …온도) ---
+    temp_cols = _detect_export_temperatures(cols)
+    if temp_cols:
+        cfg["temperature_columns"] = temp_cols
+    else:
+        # 폴백: canonical 스텝 이름 퍼지 매칭 (구형/단순 파일)
+        used: set[str] = set()
+        flat: dict = {}
+        for step in CANONICAL_STEPS:
+            pick = _fuzzy_pick(step, [c for c in cols if c not in used])
+            flat[step] = pick
+            if pick:
+                used.add(pick)
+        cfg["temperature_columns"] = flat
 
     # id/ocv 후보 퍼지 매칭
     def pick_any(names: list[str]) -> str | None:
@@ -77,16 +85,69 @@ def build_config_template(path: str | Path, sheet=0) -> dict:
                 return p
         return None
 
-    cfg["id_columns"]["cell_id"] = pick_any(["CELL_ID", "cell id", "cellno", "cell no", "셀id", "셀번호"])
-    cfg["id_columns"]["tray_id"] = pick_any(["TRAY_ID", "tray", "tray no", "트레이"])
+    cfg["id_columns"]["cell_id"] = pick_any(["Cell ID", "CELL_ID", "cell id", "cellno", "셀id"])
+    cfg["id_columns"]["tray_id"] = pick_any(["TRAY ID", "TRAY_ID", "tray", "트레이"])
+    cfg["id_columns"]["lot"] = pick_any(["Product Lot", "LOT", "랏", "lot id"])
     cfg["id_columns"]["row"] = pick_any(["ROW", "행", "cell row", "row no"])
-    cfg["id_columns"]["col"] = pick_any(["COL", "column", "열", "cell col", "col no"])
-    cfg["id_columns"]["lot"] = pick_any(["LOT", "랏", "lot id"])
-    cfg["ocv_columns"]["ocv1"] = pick_any(["전용OCV1", "OCV1", "dedicated ocv1"])
-    cfg["ocv_columns"]["ocv2"] = pick_any(["전용OCV2", "OCV2", "dedicated ocv2"])
-    cfg["ocv_columns"]["ocv3"] = pick_any(["전용OCV3", "OCV3", "dedicated ocv3"])
-    cfg["ocv_columns"]["docv7"] = pick_any(["docv7", "dOCV7", "델타ocv"])
+    cfg["id_columns"]["col"] = pick_any(["COL", "열", "cell col", "col no"])
+
+    # OCV: PRIVT OCV(전용OCV) 및 Delta OCV(docv7 직접) 감지
+    ocv = _detect_ocv(cols)
+    cfg["ocv_columns"].update(ocv["columns"])
+    if ocv["docv7_direct"]:
+        cfg["judge"]["docv7_from"] = "direct"
+
+    # 위치(row/col) 후보 안내: 못 찾으면 position_from 에 힌트 칼럼만 채워둠
+    if not (cfg["id_columns"]["row"] and cfg["id_columns"]["col"]):
+        pos_hint = pick_any(["Cell 위치", "Cell No", "Cell 위치번호", "위치"])
+        cfg["position_from"]["source_column"] = pos_hint
+        cfg["position_from"]["regex"] = None  # 값 형식 확인 후 채울 것
     return cfg
+
+
+# 온도 통계 접미사 → 표준 stat
+_TEMP_SUFFIX = [
+    (re.compile(r"^(?P<base>.+?)\s*평균\s*온도\s*$"), "mean"),
+    (re.compile(r"^(?P<base>.+?)\s*최저\s*온도\s*$"), "min"),
+    (re.compile(r"^(?P<base>.+?)\s*최고\s*온도\s*$"), "max"),
+    (re.compile(r"^(?P<base>.+?)\s*온도\s*$"), "value"),
+]
+
+
+def _detect_export_temperatures(cols: list[str]) -> dict:
+    """'… 평균/최저/최고 온도', '… 온도' 칼럼을 스텝별 {stat: col} 로 묶는다.
+
+    칼럼 등장 순서를 보존해 대략적인 공정 순서를 유지한다.
+    """
+    out: dict[str, dict] = {}
+    for c in cols:
+        for rgx, stat in _TEMP_SUFFIX:
+            m = rgx.match(str(c))
+            if m:
+                base = m.group("base").strip()
+                out.setdefault(base, {})[stat] = c
+                break
+    return out
+
+
+def _detect_ocv(cols: list[str]) -> dict:
+    """PRIVT OCV(전용OCV) #01/#02/#03, Delta OCV(docv7) 감지."""
+    columns: dict[str, str] = {}
+    docv7_direct = False
+    privt = re.compile(r"privt\s*ocv\s*#?0*(\d+)\s*ocv\s*$", re.IGNORECASE)
+    delta = re.compile(r"delta\s*ocv.*docv", re.IGNORECASE)
+    for c in cols:
+        cs = str(c)
+        m = privt.search(cs)
+        if m:
+            n = int(m.group(1))
+            if n in (1, 2, 3):
+                columns[f"ocv{n}"] = c
+            continue
+        if delta.search(cs):
+            columns["docv7"] = c
+            docv7_direct = True
+    return {"columns": columns, "docv7_direct": docv7_direct}
 
 
 def _resolve_positions(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
@@ -129,31 +190,35 @@ def load(cfg: Config) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     df = read_table(cfg.raw["input"]["path"], cfg.raw["input"]["sheet"])
     pos = _resolve_positions(df, cfg)
 
-    # --- temp_long (wide → long) ---
-    temp_map = cfg.temp_map
-    order = {s: i for i, s in enumerate(CANONICAL_STEPS)}
+    # --- temp_long (wide → long); 스텝별 대표/최저/최고 온도 ---
     frames = []
-    for step, col in temp_map.items():
-        if col not in df.columns:
-            raise KeyError(f"온도 칼럼 '{col}' (step={step}) 이 파일에 없습니다.")
+    for i, step in enumerate(cfg.temp_steps):
+        prim = cfg.primary_temp_col(step)
+        if prim not in df.columns:
+            raise KeyError(f"온도 칼럼 '{prim}' (step={step}) 이 파일에 없습니다.")
         part = pos.copy()
         part["step_name"] = step
-        part["step_order"] = order[step]
-        part["temp_raw"] = pd.to_numeric(df[col], errors="coerce")
+        part["step_order"] = i
+        part["temp_raw"] = pd.to_numeric(df[prim], errors="coerce")
+        cmin, cmax = cfg.temp_col(step, "min"), cfg.temp_col(step, "max")
+        part["temp_min_raw"] = pd.to_numeric(df[cmin], errors="coerce") if cmin else np.nan
+        part["temp_max_raw"] = pd.to_numeric(df[cmax], errors="coerce") if cmax else np.nan
         frames.append(part)
     temp_long = pd.concat(frames, ignore_index=True)
 
     # --- ocv_cell ---
     oc = cfg.raw["ocv_columns"]
-    scale = cfg.raw["judge"]["unit_scale_to_mv"]
+    j = cfg.raw["judge"]
+    scale = j["unit_scale_to_mv"]
+    d_scale = j.get("docv7_unit_scale_to_mv") or scale
     ocv = pos.copy()
     for key in ("ocv1", "ocv2", "ocv3"):
         if oc.get(key):
             ocv[key] = pd.to_numeric(df[oc[key]], errors="coerce") * scale
         else:
             ocv[key] = pd.NA
-    if cfg.raw["judge"]["docv7_from"] == "direct" and oc.get("docv7"):
-        ocv["docv7"] = pd.to_numeric(df[oc["docv7"]], errors="coerce") * scale
+    if j["docv7_from"] == "direct" and oc.get("docv7"):
+        ocv["docv7"] = pd.to_numeric(df[oc["docv7"]], errors="coerce") * d_scale
     else:
         ocv["docv7"] = ocv["ocv1"] - ocv["ocv3"]
 

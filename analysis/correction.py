@@ -21,7 +21,9 @@ def fit_factor_correction(cell_tbl: pd.DataFrame, predictors: list[str],
     ΔT 예측자는 트레이 중앙값 제거 상태이므로 예측자 부분이 곧 위치 구배.
     """
     df = cell_tbl.copy()
-    use = [p for p in predictors if p in df.columns]
+    use = [p for p in predictors if p in df.columns
+           and pd.to_numeric(df[p], errors="coerce").notna().sum() >= 20
+           and pd.to_numeric(df[p], errors="coerce").std(skipna=True) > 1e-12]
     if not use:
         df["g_hat_factor"] = 0.0
         df[f"{target}_corr_factor"] = df[target]

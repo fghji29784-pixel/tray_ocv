@@ -15,7 +15,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .config import STEP_META, Config
+from .config import STEP_META, Config, phase_of
 from .fields import add_tray_delta
 
 R_GAS = 8.314  # J/mol/K
@@ -55,12 +55,25 @@ def build(temp_clean: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, pd.DataF
     wide_abs = wide_abs.rename(columns=abs_cols).reset_index()
     feat = wide.merge(wide_abs, on=id_cols, how="left")
 
-    # --- 상(phase)별 평균 ΔT 프록시 ---
+    # --- 자기발열(승온) 피처: 최고-최저 온도 → ΔT_rise::step ---
+    if {"temp_min_raw", "temp_max_raw"}.issubset(long.columns):
+        rise = long.copy()
+        rise["rise"] = pd.to_numeric(rise["temp_max_raw"], errors="coerce") - \
+            pd.to_numeric(rise["temp_min_raw"], errors="coerce")
+        rise = add_tray_delta(rise, "rise", by=("tray_id", "step_name"), out_col="d_rise")
+        wide_rise = rise.pivot_table(index=id_cols, columns="step_name",
+                                     values="d_rise", aggfunc="first")
+        wide_rise.columns = [f"dTrise::{c}" for c in wide_rise.columns]
+        if wide_rise.notna().any().any():
+            feat = feat.merge(wide_rise.reset_index(), on=id_cols, how="left")
+
+    # --- 상(phase)별 평균 ΔT ---
     def phase_steps(phase: str) -> list[str]:
-        return [s for s in present if STEP_META.get(s, {}).get("phase") == phase]
+        return [s for s in present if phase_of(s) == phase]
 
     charge_steps = phase_steps("charge")
     dis_steps = phase_steps("discharge")
+    ocvmeas_steps = phase_steps("ocv_meas")  # 전용OCV(PRIVT) 측정지점 온도
 
     def mean_dT(steps: list[str]) -> pd.Series:
         cols = [f"dT::{s}" for s in steps if f"dT::{s}" in feat.columns]
@@ -69,14 +82,36 @@ def build(temp_clean: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, pd.DataF
     feat["dT_charge_mean"] = mean_dT(charge_steps)
     feat["dT_discharge_mean"] = mean_dT(dis_steps)
 
-    # P1 프록시: 전용OCV 직전 마지막 관측 (가장 뒤 discharge)
-    last_dis = dis_steps[-1] if dis_steps else (present[-1] if present else None)
-    if last_dis and f"dT::{last_dis}" in feat.columns:
-        feat["dT_preOCV_proxy"] = feat[f"dT::{last_dis}"]
-    else:
-        feat["dT_preOCV_proxy"] = np.nan
+    # --- P1 핵심: 전용OCV 측정지점 온도차 (프록시 아닌 실측) ---
+    def find_meas(nums) -> str | None:
+        for s in ocvmeas_steps:
+            sl = s.lower().replace(" ", "")
+            if any(f"#{n:02d}" in sl or f"#{n}" in sl or f"0{n}" in sl for n in nums):
+                return s
+        return None
 
-    # P3 프록시: HT 에이징 직전/직후 충전 스텝 ΔT 평균
+    m1 = find_meas([1])
+    m3 = find_meas([3])
+    col1 = f"dT::{m1}" if m1 and f"dT::{m1}" in feat.columns else None
+    col3 = f"dT::{m3}" if m3 and f"dT::{m3}" in feat.columns else None
+    if col1:
+        feat["dT_ocvmeas1"] = feat[col1]
+    if col3:
+        feat["dT_ocvmeas3"] = feat[col3]
+    if col1 and col3:
+        # dOCV7 = OCV1 - OCV3 → P1 직접 예측자: 측정시점 온도차
+        feat["dT_ocv1_minus_ocv3"] = feat[col1] - feat[col3]
+
+    # preOCV 프록시: 측정지점(#01) 온도 우선, 없으면 마지막 방전
+    if col1:
+        feat["dT_preOCV_proxy"] = feat[col1]
+    else:
+        last_dis = dis_steps[-1] if dis_steps else (present[-1] if present else None)
+        feat["dT_preOCV_proxy"] = (feat[f"dT::{last_dis}"]
+                                   if last_dis and f"dT::{last_dis}" in feat.columns
+                                   else np.nan)
+
+    # P3 프록시: HT 에이징 인접 스텝 (온도 데이터에 aging 없으면 비게 됨)
     ht_adjacent = _ht_adjacent_steps(present)
     feat["dT_HT_adjacent"] = mean_dT(ht_adjacent)
 
@@ -95,13 +130,16 @@ def build(temp_clean: pd.DataFrame, cfg: Config) -> tuple[pd.DataFrame, pd.DataF
 
 
 def _ht_adjacent_steps(present: list[str]) -> list[str]:
-    """HT 에이징 바로 앞/뒤의 충방전(관측되는) 스텝을 프록시로."""
+    """HT 에이징 바로 앞/뒤의 충방전(관측되는) 스텝을 프록시로.
+
+    (온도 데이터에 aging 스텝이 없으면 빈 리스트 — 실 Export 데이터가 그러함)
+    """
     out: list[str] = []
     for i, s in enumerate(present):
         if STEP_META.get(s, {}).get("high_temp"):
             for j in (i - 1, i + 1):
                 if 0 <= j < len(present):
                     nb = present[j]
-                    if STEP_META.get(nb, {}).get("phase") in ("charge", "discharge"):
+                    if phase_of(nb) in ("charge", "discharge"):
                         out.append(nb)
     return list(dict.fromkeys(out))

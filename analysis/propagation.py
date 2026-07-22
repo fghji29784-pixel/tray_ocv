@@ -16,13 +16,26 @@ except Exception:  # pragma: no cover
     _HAS_SM = False
 
 
+def _usable_predictors(df: pd.DataFrame, predictors: list[str],
+                       min_valid: int = 20) -> list[str]:
+    """존재 + 유효표본 충분 + 비상수 예측자만 남긴다 (전부-NaN 예측자 제거)."""
+    out = []
+    for p in predictors:
+        if p not in df.columns:
+            continue
+        v = pd.to_numeric(df[p], errors="coerce")
+        if v.notna().sum() >= min_valid and v.std(skipna=True) > 1e-12:
+            out.append(p)
+    return out
+
+
 def fit_paths(cell_tbl: pd.DataFrame, target: str, predictors: list[str],
               exclude_imputed: bool = False) -> dict:
     """OLS 적합 + 표준화 계수/기여도. 반환 dict."""
     df = cell_tbl.copy()
     if exclude_imputed and "any_imputed" in df.columns:
         df = df[~df["any_imputed"].astype(bool)]
-    use = [p for p in predictors if p in df.columns]
+    use = _usable_predictors(df, predictors)
     cols = [target] + use
     d = df[cols].apply(pd.to_numeric, errors="coerce").dropna()
     if len(d) < max(20, 3 * len(use)) or not use:
@@ -72,7 +85,7 @@ def ocv_progression(cell_tbl: pd.DataFrame, step_predictor: str) -> pd.DataFrame
 def holdout_validate(cell_tbl: pd.DataFrame, target: str, predictors: list[str],
                      seed: int = 0, test_frac: float = 0.2) -> dict:
     """트레이 8:2 분할 → train 계수로 test 예측, 트레이별 공간 상관."""
-    use = [p for p in predictors if p in cell_tbl.columns]
+    use = _usable_predictors(cell_tbl, predictors)
     if not use:
         return {"ok": False, "reason": "예측자 없음"}
     trays = np.asarray(cell_tbl["tray_id"].dropna().unique(), dtype=object)

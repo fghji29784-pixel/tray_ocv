@@ -90,8 +90,11 @@ def _build_cell_table(cfg: Config, log: "Progress"):
 
 def _predictor_lists(cfg: Config, cell: pd.DataFrame):
     step_preds = [f"dT::{s}" for s in cfg.present_steps if f"dT::{s}" in cell.columns]
+    step_preds += [f"dTrise::{s}" for s in cfg.present_steps
+                   if f"dTrise::{s}" in cell.columns]
     proxy = [c for c in ["dT_charge_mean", "dT_discharge_mean", "dT_preOCV_proxy",
-                         "dT_HT_adjacent"] if c in cell.columns]
+                         "dT_HT_adjacent", "dT_ocvmeas1", "dT_ocvmeas3",
+                         "dT_ocv1_minus_ocv3"] if c in cell.columns]
     heat = [c for c in cell.columns if c.startswith("dHeatExp_ea")]
     return step_preds, proxy, heat
 
@@ -148,8 +151,9 @@ def cmd_run(args):
     log("[S6] 경로 판별 회귀 + 검증")
     # 열노출은 Ea별로 서로 단조변환(공선성) → 회귀엔 대표 1개만 사용
     heat_one = [heat[len(heat) // 2]] if heat else []
-    path_preds = [c for c in ["dT_preOCV_proxy", "dT_HT_adjacent"] + heat_one
-                  if c in cell.columns]
+    # P1 직접 예측자(측정시점 온도차)가 있으면 최우선, 없으면 프록시
+    p1 = "dT_ocv1_minus_ocv3" if "dT_ocv1_minus_ocv3" in cell.columns else "dT_preOCV_proxy"
+    path_preds = [c for c in [p1, "dT_HT_adjacent"] + heat_one if c in cell.columns]
     log(f"S6  회귀 (예측자 {path_preds}) …", 1)
     fit = propagation.fit_paths(cell, "d_docv7", path_preds, exclude_imputed=False)
     if fit.get("ok"):

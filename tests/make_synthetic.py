@@ -85,8 +85,64 @@ def make(n_trays=30, n_rows=12, n_cols=8, seed=0, coupling_mv_per_K=0.15):
     return df
 
 
+def make_export(n_trays=30, n_rows=12, n_cols=8, seed=0, coupling_mv_per_K=0.15):
+    """실제 Export_*.xlsx 스키마를 모사 (평균/최저/최고 온도, PRIVT OCV 온도,
+    Delta OCV #07). P1 커플링: PRIVT OCV #01 온도 vs #03 온도 차 → docv7."""
+    rng = np.random.default_rng(seed)
+    rr, cc = np.indices((n_rows, n_cols))
+    edge = np.minimum.reduce([rr, n_rows - 1 - rr, cc, n_cols - 1 - cc]).astype(float)
+    ring = (edge.mean() - edge)
+    ring /= (np.abs(ring).max() + 1e-9)
+    charges = [f"Charge #{i:02d}" for i in range(1, 8)]
+    discharges = [f"DisCharge #{i:02d}" for i in range(1, 8)]
+    rows = []
+    for t in range(n_trays):
+        tray_id = f"T{t:03d}"
+        ring_amp_C = rng.choice([0.0, 0.0, 1.0, 2.0, 3.0])
+        sign = rng.choice([1.0, -1.0])
+        env = 25.0 + rng.normal(0, 0.3)
+        # 전용OCV 측정지점 온도 필드 (#01, #03 이 서로 다른 링 국면)
+        T_ocv1 = env + sign * ring_amp_C * ring + rng.normal(0, 0.15, ring.shape)
+        T_ocv3 = env + 0.4 * sign * ring_amp_C * ring + rng.normal(0, 0.15, ring.shape)
+        T_ocv2 = 0.5 * (T_ocv1 + T_ocv3)
+        for r in range(n_rows):
+            for c in range(n_cols):
+                rec = {"Product Lot": "L0", "TRAY ID": tray_id,
+                       "Cell ID": f"{tray_id}R{r+1:02d}C{c+1:02d}", "Can ID": "-",
+                       "Vent ID": "-", "등급": "A", "Cell No": r * n_cols + c + 1,
+                       "Cell 위치": f"R{r+1:02d}C{c+1:02d}", "ROW": r + 1, "COL": c + 1}
+                for name in ("Low Current Inspection #01", "Low Current Inspection #02"):
+                    rec[f"{name} 온도"] = env + rng.normal(0, 0.3)
+                for name in charges:
+                    base = env + rng.normal(1.5, 0.4)
+                    rec[f"{name} 최저 온도"] = base - abs(rng.normal(0.5, 0.2))
+                    rec[f"{name} 평균 온도"] = base
+                    rec[f"{name} 최고 온도"] = base + abs(rng.normal(0.8, 0.3))
+                for name in discharges:
+                    base = env + rng.normal(1.0, 0.4)
+                    rec[f"{name} 최저 온도"] = base - abs(rng.normal(0.4, 0.2))
+                    rec[f"{name} 평균 온도"] = base
+                    rec[f"{name} 최고 온도"] = base + abs(rng.normal(0.6, 0.3))
+                # 전용OCV 측정지점 온도
+                rec["PRIVT OCV #01 온도"] = T_ocv1[r, c]
+                rec["PRIVT OCV #02 온도"] = T_ocv2[r, c]
+                rec["PRIVT OCV #03 온도"] = T_ocv3[r, c]
+                # docv7 = 커플링(측정시점 온도차) + 잡음 (mV)
+                dT = (T_ocv1[r, c] - np.median(T_ocv1)) - (T_ocv3[r, c] - np.median(T_ocv3))
+                docv7 = coupling_mv_per_K * dT + rng.normal(0, 0.05)
+                ocv3 = 3.35 + rng.normal(0, 0.0005)
+                rec["PRIVT OCV #03 OCV"] = ocv3
+                rec["PRIVT OCV #01 OCV"] = ocv3 + docv7 / 1000.0
+                rec["PRIVT OCV #02 OCV"] = ocv3 + 0.6 * docv7 / 1000.0
+                rec["Delta OCV #07 DOCV"] = docv7   # mV 단위 직접 제공
+                rows.append(rec)
+    return pd.DataFrame(rows)
+
+
 if __name__ == "__main__":
     import sys
+    schema = sys.argv[2] if len(sys.argv) > 2 else "simple"
     out = sys.argv[1] if len(sys.argv) > 1 else "data/raw/synthetic.csv"
-    make().to_csv(out, index=False, encoding="utf-8-sig")
-    print("wrote", out)
+    df = make_export() if schema == "export" else make()
+    df.to_csv(out, index=False, encoding="utf-8-sig")
+    print("wrote", out, f"({schema}, {df.shape[1]} cols)")

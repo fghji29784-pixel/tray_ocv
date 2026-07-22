@@ -9,8 +9,20 @@
 
 ## 데이터 형식
 
-wide 포맷 — **1행 = 셀 1개**, 각 공정 스텝이 **온도 칼럼**, 전용OCV1~3 칼럼 포함.
-트레이 내 위치는 `ROW`/`COL` 칼럼 또는 `CELL_ID`에서 정규식 파싱으로 얻는다.
+wide 포맷 — **1행 = 셀 1개**. 두 가지 스키마를 자동 인식한다:
+
+1. **Export 형식** (실 생산 데이터): `Charge #01 평균/최저/최고 온도`,
+   `DisCharge #07 …`, `Low Current Inspection #01 온도`,
+   `PRIVT OCV #01/#02/#03 온도`(= 전용OCV 측정지점 온도), `PRIVT OCV #0N OCV`(전용OCV),
+   `Delta OCV #07 DOCV`(= docv7 직접). `make-config`가 이 형식을 자동으로 묶는다.
+   - Charge/DisCharge의 (최고−최저)는 **자기발열(승온) 피처**로 자동 추출.
+   - `PRIVT OCV #01 온도 − #03 온도` = **P1(측정시점 온도차) 직접 예측자**로
+     구성되어 docv7 구배의 상관·회귀·보정에 바로 쓰인다.
+2. **단순 형식**: 각 공정 스텝이 온도 칼럼 1개(`1st Charging` 등), `전용OCV1~3`.
+
+트레이 내 위치(`row`/`col`)는 `ROW`/`COL` 칼럼, 또는 `Cell 위치`/`Cell No` 같은
+칼럼에서 정규식 파싱(`position_from`)으로 얻는다. Export 파일에 `ROW`/`COL`이
+없으면 `column_config.yaml`의 `position_from`에 파싱 규칙을 지정해야 한다(아래).
 
 ## 설치
 
@@ -34,10 +46,29 @@ python -m analysis.run_pipeline run --config analysis/column_config.yaml
 ```
 
 `column_config.yaml`에서 반드시 확인할 항목:
-- `judge.unit_scale_to_mv`: OCV 원시 단위가 V면 **1000**, 이미 mV면 1.
-- `judge.docv7_from`: `ocv1_minus_ocv3`(기본) 또는 `direct`(docv7 칼럼 제공 시).
+- `judge.unit_scale_to_mv`: **ocv1/2/3** 원시 단위가 V면 **1000**, 이미 mV면 1.
+- `judge.docv7_unit_scale_to_mv`: **docv7 직접칼럼**(Delta OCV) 단위 배수. 이미 mV면 1,
+  V면 1000, null이면 위 값과 동일 적용. (Export는 보통 Delta OCV가 mV → **1**)
+- `judge.docv7_from`: `direct`(Delta OCV 칼럼) 또는 `ocv1_minus_ocv3`.
 - `preprocess.temp_min_valid`: 기본 22 (이 값 **이하** 삭제 후 3×3 치환).
 - `tray_shape.n_rows`: 기본 12. `n_cols`는 null이면 자동 추론.
+- **`position_from`**: `ROW`/`COL` 칼럼이 없을 때 위치를 파싱할 규칙.
+  예) `Cell 위치` 값이 `R03C05` 형식이면:
+  ```yaml
+  position_from:
+    source_column: "Cell 위치"
+    regex: "R(?P<row>\\d+)C(?P<col>\\d+)"
+  ```
+
+온도 칼럼 매핑은 Export 형식에서 스텝별로 이렇게 묶인다:
+```yaml
+temperature_columns:
+  "Charge #01":
+    min:  "Charge #01 최저 온도"
+    mean: "Charge #01 평균 온도"
+    max:  "Charge #01 최고 온도"
+  "PRIVT OCV #01": {value: "PRIVT OCV #01 온도"}
+```
 
 ## 출력
 

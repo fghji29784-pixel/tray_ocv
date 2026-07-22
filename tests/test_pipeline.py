@@ -85,10 +85,10 @@ def test_end_to_end_detects_planted_step():
     path = os.path.join(tmp, "syn.csv")
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
+    from analysis.config import CANONICAL_STEPS
     cfg = Config()
     cfg.raw["input"]["path"] = path
-    for s in cfg.raw["temperature_columns"]:
-        cfg.raw["temperature_columns"][s] = s  # 이름 동일
+    cfg.raw["temperature_columns"] = {s: s for s in CANONICAL_STEPS}  # 이름 동일
     cfg.raw["judge"]["unit_scale_to_mv"] = 1000.0
 
     temp_long, ocv, meta = io_loader.load(cfg)
@@ -103,6 +103,43 @@ def test_end_to_end_detects_planted_step():
     top = scr.iloc[0]["predictor"]
     assert top == "dT::7th Discharge", f"top={top}"
     assert scr.iloc[0]["median"] > 0.1
+
+
+def test_export_schema_autodetect_and_p1():
+    """Export 스키마 자동감지 + P1(측정지점 온도차)이 docv7 구배를 설명하는지."""
+    from tests.make_synthetic import make_export
+    from analysis import io_loader, preprocess, features, screening
+    from analysis.config import load_config, save_config
+    from analysis.judge import apply_judgment
+    from analysis.fields import add_tray_delta
+    import tempfile, os
+
+    df = make_export(n_trays=20, seed=2)
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, "export.csv")
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+    # 자동 매핑 → 유닛만 조정
+    cfg_dict = io_loader.build_config_template(path)
+    assert cfg_dict["judge"]["docv7_from"] == "direct"
+    assert cfg_dict["ocv_columns"]["ocv1"] == "PRIVT OCV #01 OCV"
+    assert any("Charge #01" == k for k in cfg_dict["temperature_columns"])
+    cfg_dict["judge"]["unit_scale_to_mv"] = 1000.0
+    cfg_dict["judge"]["docv7_unit_scale_to_mv"] = 1.0
+    cfg_path = os.path.join(tmp, "cfg.yaml")
+    save_config(cfg_dict, cfg_path)
+    cfg = load_config(cfg_path)
+
+    temp_long, ocv, meta = io_loader.load(cfg)
+    temp_clean, _ = preprocess.run(temp_long, cfg)
+    ocv_j = apply_judgment(ocv, 0.8, 0.05)
+    add_tray_delta(ocv_j, "docv7", by=("tray_id",), out_col="d_docv7")
+    feat, _ = features.build(temp_clean, cfg)
+    cell = feat.merge(ocv_j[["cell_id", "d_docv7"]], on="cell_id", how="left")
+    assert "dT_ocv1_minus_ocv3" in cell.columns
+
+    scr = screening.screen(cell, ["dT_ocv1_minus_ocv3"], ["d_docv7"], n_perm=30, seed=0)
+    assert scr.iloc[0]["median"] > 0.4, scr.iloc[0]["median"]
 
 
 def _run_all():

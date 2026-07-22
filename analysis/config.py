@@ -88,8 +88,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "n_rows": 12,
         "n_cols": None,           # null이면 데이터에서 자동 추론
     },
-    # canonical step -> 실제 엑셀 온도 칼럼명. 없는 스텝은 null.
-    "temperature_columns": {s: None for s in CANONICAL_STEPS},
+    # 스텝 라벨 -> 온도 칼럼. 두 형식 지원:
+    #   "1st Charging": "실제칼럼명"                       (단일 온도)
+    #   "Charge #01": {mean: "...평균 온도", min: "...최저 온도", max: "...최고 온도"}
+    # make-config 가 Export 형식(평균/최저/최고 온도, PRIVT OCV 온도)을 자동으로 채운다.
+    "temperature_columns": {},
     "ocv_columns": {
         "ocv1": "전용OCV1",
         "ocv2": "전용OCV2",
@@ -107,7 +110,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "judge": {
         "docv7_from": "ocv1_minus_ocv3",  # "ocv1_minus_ocv3" | "direct"
         "offset_mv": 0.8,         # (셀 docv7 - tray mode) > offset → 불량
-        "unit_scale_to_mv": 1.0,  # 원시 전압을 mV로 변환하는 배수 (V면 1000)
+        "unit_scale_to_mv": 1.0,  # ocv1/2/3 원시 전압 → mV 배수 (V면 1000)
+        "docv7_unit_scale_to_mv": None,  # docv7 직접칼럼 단위 배수 (null이면 위 값 사용)
         "mode_bin_mv": 0.05,      # tray mode 추정 히스토그램 bin 폭 (mV)
     },
     "run": {
@@ -116,6 +120,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "arrhenius_ea_kj": [40.0, 50.0, 60.0],  # 자기방전 활성화에너지 감도
     },
 }
+
+
+def phase_of(label: str) -> str:
+    """스텝 라벨에서 공정 상(phase) 추정 (Export 라벨 및 canonical 모두 대응)."""
+    l = str(label).lower()
+    if "discharge" in l:
+        return "discharge"
+    if "charge" in l:
+        return "charge"
+    if "low current" in l or "lci" in l or "미세" in l:
+        return "lci"
+    if "privt" in l or "전용" in l:
+        return "ocv_meas"      # 전용OCV 측정 지점 온도 (P1 핵심)
+    if "ocv" in l:
+        return "ocv_inter"     # 중간 OCV 측정
+    if "aging" in l or "에이징" in l:
+        return "aging"
+    return "other"
 
 
 @dataclass
@@ -131,16 +153,47 @@ class Config:
             node = node[k]
         return node
 
+    @staticmethod
+    def _temp_entry(v) -> dict[str, str] | None:
+        """온도 매핑 값 정규화 → {stat: col}. 문자열이면 {'value': col}."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return {"value": v}
+        if isinstance(v, dict):
+            d = {k: c for k, c in v.items() if c}
+            return d or None
+        return None
+
+    @property
+    def temp_steps(self) -> list[str]:
+        """온도가 하나라도 매핑된 스텝 라벨을 설정(칼럼) 순서대로."""
+        return [s for s, v in self.raw["temperature_columns"].items()
+                if self._temp_entry(v)]
+
+    def primary_temp_col(self, step: str) -> str | None:
+        """스텝의 대표 온도 칼럼 (평균 > value > 최고 > 최저 우선)."""
+        e = self._temp_entry(self.raw["temperature_columns"].get(step))
+        if not e:
+            return None
+        for stat in ("mean", "value", "max", "min"):
+            if stat in e:
+                return e[stat]
+        return next(iter(e.values()), None)
+
+    def temp_col(self, step: str, stat: str) -> str | None:
+        e = self._temp_entry(self.raw["temperature_columns"].get(step))
+        return e.get(stat) if e else None
+
     @property
     def temp_map(self) -> dict[str, str]:
-        """canonical step -> 실제 칼럼 (null 제외, 존재하는 것만)."""
-        return {s: c for s, c in self.raw["temperature_columns"].items() if c}
+        """스텝 -> 대표 온도 칼럼."""
+        return {s: self.primary_temp_col(s) for s in self.temp_steps}
 
     @property
     def present_steps(self) -> list[str]:
-        """온도 칼럼이 매핑된 스텝을 canonical 순서로."""
-        tm = self.temp_map
-        return [s for s in CANONICAL_STEPS if s in tm]
+        """온도가 매핑된 스텝 (설정 순서 유지)."""
+        return self.temp_steps
 
     def validate(self) -> list[str]:
         """설정 정합성 검사. 문제 목록 반환 (빈 리스트면 OK)."""
