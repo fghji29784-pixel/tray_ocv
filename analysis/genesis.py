@@ -73,6 +73,65 @@ def progression(cell: pd.DataFrame, stage_meta: list[dict], n_rows: int, n_cols:
     return df
 
 
+# 각 OCV 단계 직전 공정 (확정된 공정 순서 기준)
+# LCI>RT1>OCV1>C1>C2>OCV2>HT1>RT2>OCV3>C3>C4>OCV4>HT2>RT3>OCV5>
+# C5>C6>C7>OCV6>D1..D7>OCV7>RT4>PRVT1>RT5>PRVT2>RT6>PRVT3
+PROCESS_BEFORE_STAGE = {
+    "OCV #01": "LCI+RT1 (baseline)",
+    "OCV #02": "C1,C2 (charge→SOC10)",
+    "OCV #03": "HT1+RT2 (1st HT aging)",
+    "OCV #04": "C3,C4 (charge→SOC70)",
+    "OCV #05": "HT2+RT3 (2nd HT aging)",
+    "OCV #06": "C5,C6,C7 (charge→SOC100)",
+    "OCV #07": "D1~D7 (discharge→SOC30)",
+    "PRIVT OCV #01": "RT4 (aging@SOC30)",
+    "PRIVT OCV #02": "RT5 (aging@SOC30)",
+    "PRIVT OCV #03": "RT6 (aging@SOC30)",
+}
+
+
+def step_contributions(cell: pd.DataFrame, stage_meta: list[dict],
+                       n_rows: int, n_cols: int, docv7_field: str = "d_docv7") -> pd.DataFrame:
+    """공정별 기여 분해: 인접 OCV 단계의 차(ΔV=뒤−앞) 필드 링 + docv7 상관.
+
+    같은 SOC를 잇는 구간(HT1: OCV2→3, HT2: OCV4→5, 최종에이징: OCV7→PRVT…)은
+    충·방전 효과가 상쇄되어 그 공정 고유의 공간 구배만 남는다(matched_soc=True).
+    이런 구간의 차-필드 링이 최종 docv7 링과 일치하면 그 공정이 원인.
+    """
+    stages = [m for m in sorted(stage_meta, key=lambda x: x.get("order", 0))
+              if f"ocvstage::{m['label']}" in cell.columns]
+    soc = {m["label"]: m.get("soc") for m in stages}
+    labels = [m["label"] for m in stages]
+    rows = []
+    for prev, cur in zip(labels[:-1], labels[1:]):
+        d = cell[["tray_id"]].copy()
+        d["row"] = cell["row"]; d["col"] = cell["col"]
+        d["diff"] = cell[f"ocvstage::{cur}"] - cell[f"ocvstage::{prev}"]
+        add_tray_delta(d, "diff", by=("tray_id",), out_col="d_diff")
+        rings = []
+        for _, sub in d.groupby("tray_id", sort=False):
+            g = to_grid(sub, "d_diff", n_rows, n_cols)
+            if np.isfinite(g).sum() >= 0.3 * n_rows * n_cols:
+                rings.append(ring_score(g))
+        rings = np.array([r for r in rings if np.isfinite(r)])
+        cwd = {}
+        if docv7_field in cell.columns:
+            d[docv7_field] = cell[docv7_field].to_numpy()
+            cwd = aggregate(per_tray_corr_values(d, "d_diff", docv7_field))
+        # RT5/RT6(PRVT1→2→3)는 docv7=PRVT1−PRVT3 을 산술적으로 구성 → 상관이 자명(≈±1)
+        composes = prev.startswith("PRIVT") and cur.startswith("PRIVT")
+        rows.append({
+            "process": PROCESS_BEFORE_STAGE.get(cur, "?"),
+            "from_stage": prev, "to_stage": cur,
+            "matched_soc": soc.get(prev) == soc.get(cur) and soc.get(cur) is not None,
+            "composes_docv7": composes,
+            "diff_ring_abs_median": float(np.median(np.abs(rings))) if rings.size else np.nan,
+            "corr_docv7_median": cwd.get("median", np.nan),
+            "corr_docv7_signcons": cwd.get("sign_consistency", np.nan),
+        })
+    return pd.DataFrame(rows)
+
+
 def selfdischarge_segments(cell: pd.DataFrame, stage_meta: list[dict],
                            n_rows: int, n_cols: int) -> pd.DataFrame:
     """SOC30 동일 단계들(OCV#07, PRIVT#01→#02→#03) 사이 자기방전 구간별 링.

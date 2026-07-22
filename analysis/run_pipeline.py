@@ -178,21 +178,34 @@ def cmd_run(args):
     # --- S8 구배 발생 추적 (원인 공정 국소화) ---
     stage_meta = meta.get("ocv_stages", [])
     genesis_prog = pd.DataFrame()
+    steps = pd.DataFrame()
     if stage_meta:
         log(f"[S8] 구배 발생 추적 — OCV 단계 {len(stage_meta)}개")
         log("S8  단계별 Δ필드 + docv7 상관 …", 1)
         cell, _ = genesis.build_stage_deltas(cell)
         genesis_prog = genesis.progression(cell, stage_meta, n_rows, n_cols)
+        steps = genesis.step_contributions(cell, stage_meta, n_rows, n_cols)
         seg = genesis.selfdischarge_segments(cell, stage_meta, n_rows, n_cols)
         genesis_prog.to_csv(proc / "genesis_progression.csv", index=False)
+        steps.to_csv(proc / "genesis_step_contributions.csv", index=False)
         if len(seg):
             seg.to_csv(proc / "genesis_selfdischarge_segments.csv", index=False)
-        # docv7 링과 처음 크게 일치하는 단계 로그
+        # docv7 링과 처음 크게 일치하는 '단계' 로그
         gp = genesis_prog.dropna(subset=["corr_docv7_median"])
         if len(gp):
-            best = gp.loc[gp["corr_docv7_median"].abs().idxmax()]
-            log(f"S8  docv7 링과 최고 일치 단계: {best['stage']} "
-                f"(corr={best['corr_docv7_median']:.3f}, 링진폭={best['ring_abs_median']:.3g})", 2)
+            first = gp[gp["corr_docv7_median"].abs() > 0.3]
+            if len(first):
+                b = first.iloc[0]
+                log(f"S8  docv7 링이 처음 나타나는 단계: {b['stage']} "
+                    f"(corr={b['corr_docv7_median']:.3f}, 링진폭={b['ring_abs_median']:.3g})", 2)
+        # 공정별 기여: matched-SOC & docv7 구성구간 제외 → 링을 가장 크게 유발한 공정
+        if len(steps):
+            cand = steps[steps["matched_soc"] & ~steps["composes_docv7"]].dropna(
+                subset=["diff_ring_abs_median"])
+            if len(cand):
+                b = cand.loc[cand["diff_ring_abs_median"].idxmax()]
+                log(f"S8  구배 유발 유력 공정: {b['process']} "
+                    f"(차링={b['diff_ring_abs_median']:.3g}, docv7상관={b['corr_docv7_median']:.3f})", 2)
         viz.plot_stage_progression(genesis_prog,
                                    outdir / "figures" / "genesis_progression.png",
                                    title="OCV stage - gradient genesis tracking")
@@ -246,7 +259,9 @@ def cmd_run(args):
     }
     with open(outdir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2, default=_json_default)
-    _write_markdown(summary, scr, corr_eval, outdir / "report_run.md", genesis_prog)
+    genesis_steps = steps if stage_meta and len(steps) else None
+    _write_markdown(summary, scr, corr_eval, outdir / "report_run.md",
+                    genesis_prog, genesis_steps)
     log(f"[완료] 결과: {outdir}/summary.json, {outdir}/report_run.md, {proc}/")
 
 
@@ -281,13 +296,25 @@ def _json_default(o):
     return str(o)
 
 
-def _write_markdown(summary, scr, corr_eval, path, genesis_prog=None):
+def _write_markdown(summary, scr, corr_eval, path, genesis_prog=None, genesis_steps=None):
     lines = ["# 온도–OCV 구배 분석 실행 리포트\n"]
     m = summary["meta"]
     lines.append(f"- 셀 {m['n_cells']}, 트레이 {m['n_trays']}, 스텝 {m['n_steps']}\n")
 
+    if genesis_steps is not None and len(genesis_steps):
+        lines.append("\n## 공정별 구배 기여 (인접 OCV 차이 = 그 공정의 변화)\n")
+        lines.append("| 공정 | 구간 | matched SOC | 차-필드 링(median) | Δdocv7 상관 | 부호일관성 |")
+        lines.append("|---|---|---|---|---|---|")
+        for r in genesis_steps.itertuples():
+            lines.append(f"| {r.process} | {r.from_stage}→{r.to_stage} | "
+                         f"{'✓' if r.matched_soc else '—'} | "
+                         f"{_f(r.diff_ring_abs_median)} | {_f(r.corr_docv7_median)} | "
+                         f"{_f(r.corr_docv7_signcons)} |")
+        lines.append("\n> matched SOC(✓) 구간은 충·방전 효과가 상쇄돼 그 공정 고유의 "
+                     "공간 구배만 남는다. 차-필드 링이 크고 Δdocv7 상관이 높은 공정이 원인.\n")
+
     if genesis_prog is not None and len(genesis_prog):
-        lines.append("\n## 구배 발생 추적 (OCV 단계별)\n")
+        lines.append("\n## 구배 발생 추적 (OCV 단계별 누적)\n")
         lines.append("| 단계 | SOC | 링 진폭(median) | 최종 Δdocv7 상관 | 부호일관성 |")
         lines.append("|---|---|---|---|---|")
         for r in genesis_prog.itertuples():
