@@ -53,12 +53,18 @@ python -m analysis.run_pipeline run --config analysis/column_config.yaml
 - `preprocess.temp_min_valid`: 기본 22 (이 값 **이하** 삭제 후 3×3 치환).
 - `tray_shape.n_rows`: 기본 12. `n_cols`는 null이면 자동 추론.
 - **`position_from`**: `ROW`/`COL` 칼럼이 없을 때 위치를 파싱할 규칙.
-  예) `Cell 위치` 값이 `R03C05` 형식이면:
-  ```yaml
-  position_from:
-    source_column: "Cell 위치"
-    regex: "R(?P<row>\\d+)C(?P<col>\\d+)"
-  ```
+  `make-config`가 아래를 자동으로 채운다(12×12 기준). 두 방식 지원:
+  - `Cell 위치`가 `A01`~`L12` 형식(알파벳=행 A→1, 숫자=열)일 때 (자동 선택):
+    ```yaml
+    position_from:
+      source_column: "Cell 위치"
+      regex: "(?P<row>[A-Za-z]+)\\s*(?P<col>\\d+)"
+    ```
+  - `Cell No`(1~144)만 있을 때 — 행우선 산술 환산:
+    ```yaml
+    position_from:
+      from_cell_number: {column: "Cell No", n_cols: 12, row_major: true}
+    ```
 
 온도 칼럼 매핑은 Export 형식에서 스텝별로 이렇게 묶인다:
 ```yaml

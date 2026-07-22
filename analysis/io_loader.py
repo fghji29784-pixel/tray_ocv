@@ -85,11 +85,19 @@ def build_config_template(path: str | Path, sheet=0) -> dict:
                 return p
         return None
 
-    cfg["id_columns"]["cell_id"] = pick_any(["Cell ID", "CELL_ID", "cell id", "cellno", "셀id"])
+    def pick_strict(names: list[str]) -> str | None:
+        """정확 일치(정규화)만 — row/col 오탐(예: 'Cell No'→row) 방지."""
+        norm_map = {_norm(c): c for c in cols}
+        for n in names:
+            if _norm(n) in norm_map:
+                return norm_map[_norm(n)]
+        return None
+
+    cfg["id_columns"]["cell_id"] = pick_any(["Cell ID", "CELL_ID", "cell id", "셀id"])
     cfg["id_columns"]["tray_id"] = pick_any(["TRAY ID", "TRAY_ID", "tray", "트레이"])
     cfg["id_columns"]["lot"] = pick_any(["Product Lot", "LOT", "랏", "lot id"])
-    cfg["id_columns"]["row"] = pick_any(["ROW", "행", "cell row", "row no"])
-    cfg["id_columns"]["col"] = pick_any(["COL", "열", "cell col", "col no"])
+    cfg["id_columns"]["row"] = pick_strict(["ROW", "행", "row"])
+    cfg["id_columns"]["col"] = pick_strict(["COL", "열", "col", "column"])
 
     # OCV: PRIVT OCV(전용OCV) 및 Delta OCV(docv7 직접) 감지
     ocv = _detect_ocv(cols)
@@ -97,11 +105,19 @@ def build_config_template(path: str | Path, sheet=0) -> dict:
     if ocv["docv7_direct"]:
         cfg["judge"]["docv7_from"] = "direct"
 
-    # 위치(row/col) 후보 안내: 못 찾으면 position_from 에 힌트 칼럼만 채워둠
+    # 위치(row/col) 자동 설정
     if not (cfg["id_columns"]["row"] and cfg["id_columns"]["col"]):
-        pos_hint = pick_any(["Cell 위치", "Cell No", "Cell 위치번호", "위치"])
-        cfg["position_from"]["source_column"] = pos_hint
-        cfg["position_from"]["regex"] = None  # 값 형식 확인 후 채울 것
+        pos_col = pick_any(["Cell 위치", "Cell위치", "위치"])
+        cellno_col = pick_any(["Cell No", "CellNo", "Cell 번호"])
+        if pos_col:
+            # 'A01' 형식: 알파벳 행(A→1) + 숫자 열. _to_index 가 알파벳을 변환.
+            cfg["position_from"]["source_column"] = pos_col
+            cfg["position_from"]["regex"] = r"(?P<row>[A-Za-z]+)\s*(?P<col>\d+)"
+        elif cellno_col:
+            cfg["position_from"]["from_cell_number"] = {
+                "column": cellno_col, "n_cols": 12, "row_major": True}
+        cfg["tray_shape"]["n_rows"] = 12
+        cfg["tray_shape"]["n_cols"] = 12
     return cfg
 
 
@@ -150,30 +166,57 @@ def _detect_ocv(cols: list[str]) -> dict:
     return {"columns": columns, "docv7_direct": docv7_direct}
 
 
+def _to_index(s: pd.Series) -> pd.Series:
+    """행/열 라벨을 1-based 정수로. 숫자면 그대로, 알파벳이면 A→1,B→2,…(대소문자 무관)."""
+    s = s.astype(str).str.strip()
+    num = pd.to_numeric(s, errors="coerce")
+    if num.notna().mean() > 0.9:            # 대부분 숫자면 숫자 축
+        return num.astype("Int64")
+    up = s.str.upper().str.extract(r"([A-Z]+)")[0]
+
+    def conv(x):
+        if not isinstance(x, str) or not x:
+            return pd.NA
+        v = 0
+        for ch in x:
+            v = v * 26 + (ord(ch) - 64)     # A=1 … Z=26, AA=27 …
+        return v
+    return up.map(conv).astype("Int64")
+
+
 def _resolve_positions(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """row/col 을 칼럼 또는 정규식 파싱으로 확보."""
+    """row/col 을 칼럼 / 정규식 / Cell No 산술로 확보."""
     idc = cfg.raw["id_columns"]
     out = pd.DataFrame(index=df.index)
     out["cell_id"] = df[idc["cell_id"]].astype(str)
     out["tray_id"] = df[idc["tray_id"]].astype(str) if idc.get("tray_id") else "T0"
-    if idc.get("lot"):
-        out["lot"] = df[idc["lot"]].astype(str)
-    else:
-        out["lot"] = "L0"
+    out["lot"] = df[idc["lot"]].astype(str) if idc.get("lot") else "L0"
+
+    pos = cfg.raw.get("position_from", {})
+    fcn = pos.get("from_cell_number")
 
     if idc.get("row") and idc.get("col"):
-        out["row"] = pd.to_numeric(df[idc["row"]], errors="coerce").astype("Int64")
-        out["col"] = pd.to_numeric(df[idc["col"]], errors="coerce").astype("Int64")
-    else:
-        pos = cfg.raw.get("position_from", {})
-        src, rgx = pos.get("source_column"), pos.get("regex")
-        if not (src and rgx):
-            raise ValueError("row/col 칼럼도 없고 position_from(regex)도 없습니다.")
-        ext = df[src].astype(str).str.extract(rgx)
+        out["row"] = _to_index(df[idc["row"]])
+        out["col"] = _to_index(df[idc["col"]])
+    elif fcn and fcn.get("column"):
+        # Cell No(1..N) 산술: n_cols 로 행/열 환산. row_major=True → 열이 먼저 증가.
+        no = pd.to_numeric(df[fcn["column"]], errors="coerce").astype("Int64") - 1
+        w = int(fcn.get("n_cols") or cfg.raw["tray_shape"]["n_cols"] or 12)
+        if fcn.get("row_major", True):
+            out["row"] = (no // w + 1).astype("Int64")
+            out["col"] = (no % w + 1).astype("Int64")
+        else:
+            out["col"] = (no // w + 1).astype("Int64")
+            out["row"] = (no % w + 1).astype("Int64")
+    elif pos.get("source_column") and pos.get("regex"):
+        ext = df[pos["source_column"]].astype(str).str.extract(pos["regex"])
         if "tray" in ext.columns:
             out["tray_id"] = ext["tray"].astype(str)
-        out["row"] = pd.to_numeric(ext["row"], errors="coerce").astype("Int64")
-        out["col"] = pd.to_numeric(ext["col"], errors="coerce").astype("Int64")
+        out["row"] = _to_index(ext["row"])
+        out["col"] = _to_index(ext["col"])
+    else:
+        raise ValueError("위치를 얻을 수 없습니다: id_columns.row/col, "
+                         "position_from.regex, 또는 position_from.from_cell_number 중 하나를 설정하세요.")
     return out
 
 

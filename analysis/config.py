@@ -81,8 +81,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # row/col 이 별도 칼럼으로 없고 cell_id/다른 칼럼에 인코딩된 경우 정규식으로 파싱.
     # 예: "T012R03C05" -> named group tray/row/col. 미사용 시 null.
     "position_from": {
-        "source_column": None,    # 예: "CELL_ID"
-        "regex": None,            # 예: r"T(?P<tray>\d+)R(?P<row>\d+)C(?P<col>\d+)"
+        # (A) 정규식 파싱: 알파벳 행(A→1)·숫자 열 지원.
+        #     예 'Cell 위치'=A01 →  source_column: "Cell 위치", regex: "(?P<row>[A-Za-z]+)(?P<col>\\d+)"
+        "source_column": None,
+        "regex": None,
+        # (B) Cell No(1..N) 산술 환산. row_major=True 면 열이 먼저 증가(No 1..12 → 1행).
+        "from_cell_number": None,  # 예: {column: "Cell No", n_cols: 12, row_major: true}
     },
     "tray_shape": {
         "n_rows": 12,
@@ -206,10 +210,12 @@ class Config:
         pos = self.raw.get("position_from", {})
         has_rc = idc.get("row") and idc.get("col")
         has_parse = pos.get("source_column") and pos.get("regex")
-        if not (has_rc or has_parse):
+        fcn = pos.get("from_cell_number")
+        has_cellno = isinstance(fcn, dict) and fcn.get("column")
+        if not (has_rc or has_parse or has_cellno):
             problems.append(
-                "트레이 내 위치(row/col)를 얻을 수 없습니다: "
-                "id_columns.row/col 을 지정하거나 position_from(regex)을 설정하세요."
+                "트레이 내 위치(row/col)를 얻을 수 없습니다: id_columns.row/col, "
+                "position_from.regex, 또는 position_from.from_cell_number 중 하나를 설정하세요."
             )
         oc = self.raw["ocv_columns"]
         if self.raw["judge"]["docv7_from"] == "ocv1_minus_ocv3":

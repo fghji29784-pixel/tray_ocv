@@ -105,6 +105,46 @@ def test_end_to_end_detects_planted_step():
     assert scr.iloc[0]["median"] > 0.1
 
 
+def test_position_alpha_and_cellno():
+    """A01→(행1,열1), L12→(행12,열12); Cell No 1..144 산술 환산."""
+    import pandas as pd
+    from analysis.io_loader import _to_index, _resolve_positions
+    from analysis.config import Config
+
+    # 알파벳 행 변환
+    assert list(_to_index(pd.Series(["A", "B", "L"]))) == [1, 2, 12]
+    assert list(_to_index(pd.Series(["01", "12"]))) == [1, 12]
+
+    # Cell 위치 A01..L12 정규식 파싱
+    df = pd.DataFrame({
+        "Cell ID": ["x1", "x2", "x3"],
+        "TRAY ID": ["T0", "T0", "T0"],
+        "Cell 위치": ["A01", "A12", "L12"],
+    })
+    cfg = Config()
+    cfg.raw["id_columns"] = {"cell_id": "Cell ID", "tray_id": "TRAY ID",
+                             "row": None, "col": None, "lot": None}
+    cfg.raw["position_from"] = {"source_column": "Cell 위치",
+                                "regex": r"(?P<row>[A-Za-z]+)\s*(?P<col>\d+)",
+                                "from_cell_number": None}
+    pos = _resolve_positions(df, cfg)
+    assert list(pos["row"]) == [1, 1, 12]
+    assert list(pos["col"]) == [1, 12, 12]
+
+    # Cell No 산술 (row_major: No 1..12 → 1행)
+    df2 = pd.DataFrame({"Cell ID": ["a", "b", "c", "d"], "TRAY ID": ["T", "T", "T", "T"],
+                        "Cell No": [1, 12, 13, 144]})
+    cfg2 = Config()
+    cfg2.raw["id_columns"] = {"cell_id": "Cell ID", "tray_id": "TRAY ID",
+                              "row": None, "col": None, "lot": None}
+    cfg2.raw["position_from"] = {"source_column": None, "regex": None,
+                                 "from_cell_number": {"column": "Cell No",
+                                                      "n_cols": 12, "row_major": True}}
+    pos2 = _resolve_positions(df2, cfg2)
+    assert list(pos2["row"]) == [1, 1, 2, 12]
+    assert list(pos2["col"]) == [1, 12, 1, 12]
+
+
 def test_export_schema_autodetect_and_p1():
     """Export 스키마 자동감지 + P1(측정지점 온도차)이 docv7 구배를 설명하는지."""
     from tests.make_synthetic import make_export

@@ -85,7 +85,7 @@ def make(n_trays=30, n_rows=12, n_cols=8, seed=0, coupling_mv_per_K=0.15):
     return df
 
 
-def make_export(n_trays=30, n_rows=12, n_cols=8, seed=0, coupling_mv_per_K=0.15):
+def make_export(n_trays=30, n_rows=12, n_cols=12, seed=0, coupling_mv_per_K=0.15):
     """실제 Export_*.xlsx 스키마를 모사 (평균/최저/최고 온도, PRIVT OCV 온도,
     Delta OCV #07). P1 커플링: PRIVT OCV #01 온도 vs #03 온도 차 → docv7."""
     rng = np.random.default_rng(seed)
@@ -107,10 +107,13 @@ def make_export(n_trays=30, n_rows=12, n_cols=8, seed=0, coupling_mv_per_K=0.15)
         T_ocv2 = 0.5 * (T_ocv1 + T_ocv3)
         for r in range(n_rows):
             for c in range(n_cols):
+                # 실제 형식: Cell No 1..144(행우선), Cell 위치 A01..L12 (알파벳=행)
+                cell_no = r * n_cols + c + 1
+                cell_pos = f"{chr(65 + r)}{c + 1:02d}"
                 rec = {"Product Lot": "L0", "TRAY ID": tray_id,
-                       "Cell ID": f"{tray_id}R{r+1:02d}C{c+1:02d}", "Can ID": "-",
-                       "Vent ID": "-", "등급": "A", "Cell No": r * n_cols + c + 1,
-                       "Cell 위치": f"R{r+1:02d}C{c+1:02d}", "ROW": r + 1, "COL": c + 1}
+                       "Cell ID": f"{tray_id}-{cell_no:03d}", "Can ID": "-",
+                       "Vent ID": "-", "등급": "A", "Cell No": cell_no,
+                       "Cell 위치": cell_pos}
                 for name in ("Low Current Inspection #01", "Low Current Inspection #02"):
                     rec[f"{name} 온도"] = env + rng.normal(0, 0.3)
                 for name in charges:
