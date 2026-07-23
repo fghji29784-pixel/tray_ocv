@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .grids import to_grid, border_mask
+from .fields import ring_score
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +153,92 @@ def morans_progression(cell: pd.DataFrame, stage_meta: list[dict],
 # ---------------------------------------------------------------------------
 # 변화점 (a_k 수열의 계단 상승)
 # ---------------------------------------------------------------------------
+def _cp_array(y: np.ndarray) -> int | None:
+    """수열에서 평균이 가장 크게 도약하는 지점 index (1..K-1)."""
+    if np.isfinite(y).sum() < 3:
+        return None
+    best_k, best_gap = None, -np.inf
+    for k in range(1, len(y)):
+        b, a = y[:k], y[k:]
+        if np.isfinite(b).any() and np.isfinite(a).any():
+            gap = np.nanmean(a) - np.nanmean(b)
+            if gap > best_gap:
+                best_gap, best_k = gap, k
+    return best_k
+
+
+def per_tray_genesis(cell: pd.DataFrame, stage_meta: list[dict], n_rows: int, n_cols: int,
+                     target_dcol: str = "d_docv7", min_ring: float | None = None) -> dict:
+    """트레이별로 docv7 패턴의 발생 단계·유발 공정을 찾아 '분포'로 집계.
+
+    부호 있는 상관을 트레이 간 평균하면 링/역링이 상쇄되므로, 트레이마다 개별로
+    발생단계(|a_k| 변화점)·유발공정(matched-SOC 중 |증분투영| 최대)을 구해 히스토그램.
+    구조가 약한(플랫) 트레이는 제외(min_ring).
+    """
+    stages = [m for m in sorted(stage_meta, key=lambda x: x.get("order", 0))
+              if f"d_ocvstage::{m['label']}" in cell.columns]
+    labels = [m["label"] for m in stages]
+    soc = {m["label"]: m.get("soc") for m in stages}
+    dcols = [f"d_ocvstage::{lab}" for lab in labels]
+    from .genesis import PROCESS_BEFORE_STAGE
+
+    # docv7 링 진폭으로 강한 트레이 선별 임계
+    rings = {}
+    for tray, sub in cell.groupby("tray_id", sort=False):
+        g = to_grid(sub, target_dcol, n_rows, n_cols)
+        rings[tray] = abs(ring_score(g)) if np.isfinite(g).sum() >= 0.3 * n_rows * n_cols else np.nan
+    rv = np.array([v for v in rings.values() if np.isfinite(v)])
+    thr = min_ring if min_ring is not None else (np.nanmedian(rv) if rv.size else 0.0)
+
+    onset_counts = {lab: 0 for lab in labels}
+    culprit_counts = {}
+    per_rows = []
+    n_used = 0
+    for tray, sub in cell.groupby("tray_id", sort=False):
+        if not np.isfinite(rings[tray]) or rings[tray] < thr:
+            continue
+        got = _tray_matrix(sub, dcols, target_dcol, n_rows, n_cols)
+        if got is None:
+            continue
+        F, d, _ = got
+        dd = float((d * d).sum())
+        if dd < 1e-18:
+            continue
+        a = np.array([_corr(F[i], d) for i in range(len(labels))])
+        k = _cp_array(np.abs(a))
+        if k is None:
+            continue
+        onset = labels[k]
+        onset_counts[onset] += 1
+        # 유발 공정: matched-SOC & non-composes 증분 투영 최대
+        best_proc, best_val = None, -np.inf
+        for i in range(1, len(labels)):
+            prev, cur = labels[i - 1], labels[i]
+            matched = soc[prev] == soc[cur] and soc[cur] is not None
+            composes = prev.startswith("PRIVT") and cur.startswith("PRIVT")
+            if not matched or composes:
+                continue
+            g = F[i] - F[i - 1]
+            val = abs(float((g * d).sum()) / dd)
+            if val > best_val:
+                best_val, best_proc = val, PROCESS_BEFORE_STAGE.get(cur, cur)
+        if best_proc:
+            culprit_counts[best_proc] = culprit_counts.get(best_proc, 0) + 1
+        per_rows.append({"tray_id": tray, "onset_stage": onset, "onset_soc": soc[onset],
+                         "culprit_process": best_proc, "docv7_ring": rings[tray]})
+        n_used += 1
+
+    onset_df = pd.DataFrame(
+        [{"stage": lab, "soc": soc[lab], "n_trays_onset": onset_counts[lab],
+          "frac": onset_counts[lab] / n_used if n_used else np.nan}
+         for lab in labels])
+    culprit_df = pd.DataFrame(
+        [{"process": p, "n_trays": c, "frac": c / n_used if n_used else np.nan}
+         for p, c in sorted(culprit_counts.items(), key=lambda x: -x[1])])
+    return {"onset_dist": onset_df, "culprit_dist": culprit_df,
+            "per_tray": pd.DataFrame(per_rows), "n_used": n_used, "ring_thr": float(thr)}
+
+
 def changepoint(align: pd.DataFrame, col: str = "a_median") -> dict:
     """|a_k| 수열에서 평균이 가장 크게 도약하는 지점 k* (단순 최대차 분할)."""
     s = align.sort_values("order")

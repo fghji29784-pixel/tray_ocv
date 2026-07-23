@@ -223,6 +223,34 @@ def plot_alignment_moran(align: pd.DataFrame, moran: pd.DataFrame, out_path,
     return out_path
 
 
+def plot_onset_distribution(onset_df, culprit_df, out_path, n_used=None, title=""):
+    """트레이별 발생단계·유발공정 히스토그램 (부호 상쇄 없는 집계)."""
+    if onset_df is None or onset_df.empty:
+        return None
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.4))
+    x = range(len(onset_df))
+    ax1.bar(x, onset_df["frac"], color="#2c3e50")
+    ax1.set_xticks(list(x))
+    ax1.set_xticklabels([f"{r.stage}\n(SOC{int(r.soc)})" if pd.notna(r.soc) else r.stage
+                         for r in onset_df.itertuples()], rotation=45, ha="right", fontsize=8)
+    ax1.set_ylabel("fraction of trays")
+    ax1.set_title("per-tray docv7 onset stage" + (f"  (n={n_used})" if n_used else ""))
+    if culprit_df is not None and not culprit_df.empty:
+        y = range(len(culprit_df))
+        ax2.barh(list(y), culprit_df["frac"], color="#c0392b")
+        ax2.set_yticks(list(y))
+        ax2.set_yticklabels(culprit_df["process"], fontsize=8)
+        ax2.invert_yaxis()
+        ax2.set_xlabel("fraction of trays")
+        ax2.set_title("per-tray culprit process (matched-SOC)")
+    fig.suptitle(title or "gradient genesis — per-tray distribution (sign-robust)", fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+    return out_path
+
+
 def plot_corr_heatmap(screen_df: pd.DataFrame, out_path, value="median", title=""):
     """스텝×타깃 상관 히트맵 (screen 결과 pivot)."""
     if screen_df.empty:

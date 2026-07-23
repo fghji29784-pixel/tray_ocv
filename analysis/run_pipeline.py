@@ -227,6 +227,21 @@ def cmd_run(args):
             bb = bcand.loc[bcand["beta_median"].abs().idxmax()]
             log(f"S8  β 최대 공정(원인): {bb['process']} (β={bb['beta_median']:.3g})", 2)
 
+        # 트레이별 발생단계 분포 (부호 상쇄 없는 집계) — 링/역링 공존 대응
+        log("S8  트레이별 발생단계 분포 (부호-강건) …", 1)
+        ptg = genesis_math.per_tray_genesis(cell, stage_meta, n_rows, n_cols)
+        genesis_math_out["per_tray"] = ptg
+        if not ptg["onset_dist"].empty and ptg["n_used"]:
+            od = ptg["onset_dist"].sort_values("frac", ascending=False)
+            top_onset = od.iloc[0]
+            log(f"S8  [트레이 {ptg['n_used']}개] 발생단계 최빈: {top_onset['stage']} "
+                f"({top_onset['frac']*100:.0f}%)", 2)
+            if not ptg["culprit_dist"].empty:
+                tc = ptg["culprit_dist"].iloc[0]
+                log(f"S8  유발공정 최빈: {tc['process']} ({tc['frac']*100:.0f}%)", 2)
+            ptg["onset_dist"].to_csv(proc / "genesis_onset_distribution.csv", index=False)
+            ptg["culprit_dist"].to_csv(proc / "genesis_culprit_distribution.csv", index=False)
+
         # --- 강한 docv7 링 트레이만 층화 (간헐 신호 희석 방지) ---
         strong_trays = _strong_ring_trays(cell, n_rows, n_cols, frac=0.15, min_n=30)
         if strong_trays:
@@ -270,6 +285,10 @@ def cmd_run(args):
                                  changepoint_stage=cp.get("stage"))
         viz.plot_mean_field(cell, stage_labels, n_rows, n_cols,
                             pres / "common_fingerprint_meanfield.png")
+        if genesis_math_out.get("per_tray"):
+            ptg = genesis_math_out["per_tray"]
+            viz.plot_onset_distribution(ptg["onset_dist"], ptg["culprit_dist"],
+                                        pres / "onset_distribution.png", n_used=ptg["n_used"])
     else:
         log("[S8] 구배 발생 추적 생략 — 중간 OCV 단계 칼럼 없음", 0)
         genesis_math_out = None
@@ -433,6 +452,36 @@ def _write_markdown(summary, scr, corr_eval, path, genesis_prog=None, genesis_st
                          f"{_f(r.beta_median)} | {_f(r.beta_sign)} |")
         lines.append("\n> β_k = 그 공정의 변화가 최종 Δdocv7 방향에 주입한 양. "
                      "matched-SOC(✓) 중 |β| 최대가 원인 공정.\n")
+
+        # 트레이별 발생단계 분포 (부호-강건) — 링/역링 공존 시 핵심
+        ptg = gmath.get("per_tray")
+        if ptg and not ptg["onset_dist"].empty and ptg.get("n_used"):
+            lines.append(f"\n### 트레이별 발생단계 분포 (부호-강건, n={ptg['n_used']} 트레이)\n")
+            lines.append("> 링/역링이 공존하면 부호 평균(a_k,β_k)이 상쇄되므로, "
+                         "트레이마다 개별 발생단계를 찾아 히스토그램. 상쇄 없음.\n")
+            lines.append("| 발생단계 | SOC | 트레이 비율 |")
+            lines.append("|---|---|---|")
+            for r in ptg["onset_dist"].sort_values("frac", ascending=False).head(6).itertuples():
+                soc = f"{int(r.soc)}" if pd.notna(r.soc) else "–"
+                lines.append(f"| {r.stage} | {soc} | {_f(r.frac)} |")
+            if not ptg["culprit_dist"].empty:
+                lines.append("\n| 유발 공정 (matched-SOC) | 트레이 비율 |")
+                lines.append("|---|---|")
+                for r in ptg["culprit_dist"].head(5).itertuples():
+                    lines.append(f"| {r.process} | {_f(r.frac)} |")
+
+        # 강한링 트레이 층화 요약
+        strong = gmath.get("strong")
+        if strong:
+            lines.append(f"\n### 강한 docv7 링 트레이만 ({strong['n_trays']}개) 층화\n")
+            cps = strong["cp"]
+            bs = strong["beta"]
+            bsc = bs[bs["matched_soc"] & ~bs["composes_docv7"]].dropna(subset=["beta_median"])
+            msg = f"변화점=**{cps.get('stage')}**"
+            if len(bsc):
+                bb = bsc.loc[bsc["beta_median"].abs().idxmax()]
+                msg += f" · β 최대 공정=**{bb['process']}**"
+            lines.append("> " + msg + " (전체 집계와 비교해 신호가 뚜렷해지는지 확인)\n")
 
     if genesis_steps is not None and len(genesis_steps):
         lines.append("\n## 공정별 구배 기여 (인접 OCV 차이 = 그 공정의 변화)\n")
