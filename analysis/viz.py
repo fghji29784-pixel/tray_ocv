@@ -13,7 +13,8 @@ from .grids import to_grid
 
 
 def plot_field_gallery(df: pd.DataFrame, value_col: str, n_rows: int, n_cols: int,
-                       out_path, by="tray_id", max_trays=24, title="", cmap="RdBu_r"):
+                       out_path, by="tray_id", max_trays=24, title="", cmap="RdBu_r",
+                       per_panel=False):
     trays = list(df[by].dropna().unique())[:max_trays]
     if not trays:
         return None
@@ -25,15 +26,53 @@ def plot_field_gallery(df: pd.DataFrame, value_col: str, n_rows: int, n_cols: in
     for i, tray in enumerate(trays):
         ax = axes[i // ncols][i % ncols]
         grid = to_grid(df[df[by] == tray], value_col, n_rows, n_cols)
-        ax.imshow(grid, cmap=cmap, vmin=-vmax, vmax=vmax, aspect="auto")
+        if per_panel:
+            grid = _robust_norm(grid)
+            ax.imshow(grid, cmap=cmap, vmin=-1, vmax=1, aspect="equal", interpolation="nearest")
+        else:
+            ax.imshow(grid, cmap=cmap, vmin=-vmax, vmax=vmax, aspect="auto")
         ax.set_title(str(tray), fontsize=7)
         ax.set_xticks([]); ax.set_yticks([])
     for j in range(len(trays), nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
-    fig.suptitle(title or value_col, fontsize=11)
+    note = "  (per-panel contrast-normalized)" if per_panel else ""
+    fig.suptitle((title or value_col) + note, fontsize=11)
     fig.tight_layout()
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+    return out_path
+
+
+def plot_mean_field(cell, stage_labels, n_rows, n_cols, out_path,
+                    target_col="d_docv7", title="", cmap="RdBu_r"):
+    """단계별 '전 트레이 평균 필드' — 모든 트레이가 공유하는 공통 지문 여부.
+
+    강하면 설비/지그 고정 원인, 미세하면 트레이별(열이력) 원인.
+    """
+    cand = [f"d_ocvstage::{s}" for s in stage_labels] + [target_col]
+    tit = list(stage_labels) + ["docv7 (final)"]
+    cols = [(c, t) for c, t in zip(cand, tit) if c in cell.columns]
+    if not cols:
+        return None
+    nc = min(6, len(cols))
+    nr = int(np.ceil(len(cols) / nc))
+    fig, axes = plt.subplots(nr, nc, figsize=(2.1 * nc, 2.1 * nr), squeeze=False)
+    for k, (col, t) in enumerate(cols):
+        ax = axes[k // nc][k % nc]
+        mean_grid = (cell.groupby(["row", "col"])[col].mean().reset_index()
+                     .pipe(lambda d: to_grid(d.rename(columns={col: "v"}), "v", n_rows, n_cols)))
+        vmax = np.nanpercentile(np.abs(mean_grid), 98) or 1.0
+        im = ax.imshow(mean_grid, cmap=cmap, vmin=-vmax, vmax=vmax, aspect="equal")
+        ax.set_title(f"{t}\n(±{vmax:.3g})", fontsize=7)
+        ax.set_xticks([]); ax.set_yticks([])
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    for j in range(len(cols), nr * nc):
+        axes[j // nc][j % nc].axis("off")
+    fig.suptitle(title or "common fingerprint: mean field across all trays (per stage)", fontsize=11)
+    fig.tight_layout()
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=120)
     plt.close(fig)
     return out_path
 
@@ -65,36 +104,61 @@ def plot_stage_progression(prog: pd.DataFrame, out_path, title=""):
     return out_path
 
 
+def _robust_norm(grid: np.ndarray) -> np.ndarray:
+    """패널별 강건 정규화: 중앙값 제거 후 P90(|·|)로 나눠 ±1 클립.
+
+    핫셀/죽은셀이 스케일을 잡아먹는 문제 제거 → 각 패널의 '패턴'이 최대 대비로 보임.
+    """
+    g = grid.astype(float)
+    fin = np.isfinite(g)
+    if fin.sum() < 4:
+        return g
+    c = np.nanmedian(g)
+    v = g - c
+    scale = np.nanpercentile(np.abs(v[fin]), 90)
+    if not np.isfinite(scale) or scale < 1e-12:
+        return np.where(fin, 0.0, np.nan)
+    return np.clip(v / scale, -1, 1)
+
+
 def plot_storyboard(cell, stage_labels, trays, n_rows, n_cols, out_path,
-                    target_col="d_docv7", title="", cmap="RdBu_r"):
-    """대표 트레이(행) × 전 단계(열) small-multiples — 링이 어느 칸에서 켜지는지."""
-    cols_data = [f"d_ocvstage::{s}" for s in stage_labels] + [target_col]
-    col_titles = list(stage_labels) + ["Δdocv7 (final)"]
-    cols_data = [c for c, t in zip(cols_data, col_titles) if c in cell.columns]
-    col_titles = [t for c, t in zip([f"d_ocvstage::{s}" for s in stage_labels] + [target_col],
-                                    col_titles) if c in cell.columns]
+                    target_col="d_docv7", title="", cmap="RdBu_r", per_panel=True):
+    """대표 트레이(행) × 전 단계(열) small-multiples — 링이 어느 칸에서 켜지는지.
+
+    per_panel=True: 패널마다 강건 정규화(핫셀 무시, 각 패널 패턴을 최대 대비로).
+    """
+    cand = [f"d_ocvstage::{s}" for s in stage_labels] + [target_col]
+    tit = list(stage_labels) + ["docv7 (final)"]
+    cols_data = [c for c in cand if c in cell.columns]
+    col_titles = [t for c, t in zip(cand, tit) if c in cell.columns]
     if not trays or not cols_data:
         return None
-    vmax = np.nanpercentile(np.abs(pd.to_numeric(
-        cell[cell["tray_id"].isin(trays)][cols_data].stack(), errors="coerce")), 96)
-    vmax = vmax if np.isfinite(vmax) and vmax > 0 else 1.0
+    gvmax = 1.0
+    if not per_panel:
+        gvmax = np.nanpercentile(np.abs(pd.to_numeric(
+            cell[cell["tray_id"].isin(trays)][cols_data].stack(), errors="coerce")), 96) or 1.0
     nr, nc = len(trays), len(cols_data)
-    fig, axes = plt.subplots(nr, nc, figsize=(1.35 * nc, 1.5 * nr), squeeze=False)
+    fig, axes = plt.subplots(nr, nc, figsize=(1.7 * nc, 1.8 * nr), squeeze=False)
     for i, tray in enumerate(trays):
         sub = cell[cell["tray_id"] == tray]
         for jj, col in enumerate(cols_data):
             ax = axes[i][jj]
-            ax.imshow(to_grid(sub, col, n_rows, n_cols), cmap=cmap, vmin=-vmax, vmax=vmax,
-                      aspect="auto")
+            g = to_grid(sub, col, n_rows, n_cols)
+            g = _robust_norm(g) if per_panel else g
+            ax.imshow(g, cmap=cmap, vmin=-1 if per_panel else -gvmax,
+                      vmax=1 if per_panel else gvmax, aspect="equal", interpolation="nearest")
             ax.set_xticks([]); ax.set_yticks([])
+            for s in ax.spines.values():
+                s.set_linewidth(0.4); s.set_color("#bbbbbb")
             if i == 0:
-                ax.set_title(col_titles[jj], fontsize=7, rotation=30, ha="left")
+                ax.set_title(col_titles[jj], fontsize=8, rotation=32, ha="left")
             if jj == 0:
-                ax.set_ylabel(str(tray), fontsize=7)
-    fig.suptitle(title or "gradient genesis storyboard (tray × stage)", fontsize=11)
+                ax.set_ylabel(str(tray), fontsize=8)
+    note = "  (each panel independently contrast-normalized; hot cells clipped)" if per_panel else ""
+    fig.suptitle((title or "gradient genesis storyboard (tray × stage)") + note, fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=120)
+    fig.savefig(out_path, dpi=130)
     plt.close(fig)
     return out_path
 

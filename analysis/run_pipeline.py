@@ -227,25 +227,49 @@ def cmd_run(args):
             bb = bcand.loc[bcand["beta_median"].abs().idxmax()]
             log(f"S8  β 최대 공정(원인): {bb['process']} (β={bb['beta_median']:.3g})", 2)
 
-        # --- 발표용 시각자료 ---
+        # --- 강한 docv7 링 트레이만 층화 (간헐 신호 희석 방지) ---
+        strong_trays = _strong_ring_trays(cell, n_rows, n_cols, frac=0.15, min_n=30)
+        if strong_trays:
+            cell_s = cell[cell["tray_id"].isin(strong_trays)]
+            align_s, beta_s = genesis_math.alignment_and_projection(
+                cell_s, stage_meta, n_rows, n_cols)
+            moran_s = genesis_math.morans_progression(cell_s, stage_meta, n_rows, n_cols)
+            cp_s = genesis_math.changepoint(align_s)
+            align_s.to_csv(proc / "genesis_alignment_strongring.csv", index=False)
+            beta_s.to_csv(proc / "genesis_beta_strongring.csv", index=False)
+            log(f"S8  [강한링 트레이 {len(strong_trays)}개] 변화점="
+                f"{cp_s.get('stage')}", 2)
+            bcs = beta_s[beta_s["matched_soc"] & ~beta_s["composes_docv7"]].dropna(
+                subset=["beta_median"])
+            if len(bcs):
+                bbs = bcs.loc[bcs["beta_median"].abs().idxmax()]
+                log(f"S8  [강한링] β 최대 공정: {bbs['process']} (β={bbs['beta_median']:.3g})", 2)
+            genesis_math_out["strong"] = {"align": align_s, "beta": beta_s,
+                                          "moran": moran_s, "cp": cp_s,
+                                          "n_trays": len(strong_trays)}
+
+        # --- 발표용 시각자료 (패널별 정규화로 핫셀·저진폭 문제 해결) ---
         log("S8  발표용 시각자료 생성 …", 1)
         pres = outdir / "figures" / "presentation"
         trays_curated = _curate_trays(cell, n_rows, n_cols, n_top=8, n_rand=4, seed=seed)
         stage_labels = [m["label"] for m in sorted(stage_meta, key=lambda x: x.get("order", 0))]
-        # 단계별 OCV 갤러리
         sub_cur = cell[cell["tray_id"].isin(trays_curated)]
         for lab in stage_labels:
             dcol = f"d_ocvstage::{lab}"
             if dcol in cell.columns:
                 viz.plot_field_gallery(sub_cur, dcol, n_rows, n_cols,
                                        pres / f"gallery_stage_{_safe(lab)}.png",
-                                       max_trays=12, title=f"dOCV field — {lab}")
-        # 스토리보드 / β 막대 / a_k·Moran 곡선
-        viz.plot_storyboard(cell, stage_labels, trays_curated[:6], n_rows, n_cols,
-                            pres / "storyboard.png")
+                                       max_trays=12, title=f"dOCV field — {lab}",
+                                       per_panel=True)
+        # 스토리보드(강한링 트레이 우선) / β / a_k·Moran / 공통지문
+        story_trays = (strong_trays[:6] if strong_trays else trays_curated[:6])
+        viz.plot_storyboard(cell, stage_labels, story_trays, n_rows, n_cols,
+                            pres / "storyboard.png", per_panel=True)
         viz.plot_beta_contributions(beta, pres / "beta_contributions.png")
         viz.plot_alignment_moran(align, moran, pres / "alignment_moran.png",
                                  changepoint_stage=cp.get("stage"))
+        viz.plot_mean_field(cell, stage_labels, n_rows, n_cols,
+                            pres / "common_fingerprint_meanfield.png")
     else:
         log("[S8] 구배 발생 추적 생략 — 중간 OCV 단계 칼럼 없음", 0)
         genesis_math_out = None
@@ -334,6 +358,20 @@ def _curate_trays(cell: pd.DataFrame, n_rows: int, n_cols: int,
     rest = [t for t in cell["tray_id"].dropna().unique() if t not in top]
     rand = list(rng.choice(rest, size=min(n_rand, len(rest)), replace=False)) if rest else []
     return top + rand
+
+
+def _strong_ring_trays(cell: pd.DataFrame, n_rows: int, n_cols: int,
+                       frac: float = 0.15, min_n: int = 30) -> list:
+    """Δdocv7 링 진폭 상위 frac 트레이 (간헐 신호 층화용)."""
+    from .fields import structure_table
+    if "d_docv7" not in cell.columns:
+        return []
+    st = structure_table(cell, "d_docv7", n_rows, n_cols, by=("tray_id",)).dropna(subset=["ring"])
+    if st.empty:
+        return []
+    st = st.reindex(st["ring"].abs().sort_values(ascending=False).index)
+    n = max(min_n, int(len(st) * frac))
+    return st["tray_id"].head(n).tolist()
 
 
 def _save_table(df: pd.DataFrame, path_no_ext: Path):
